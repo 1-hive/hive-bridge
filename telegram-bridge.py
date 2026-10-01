@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -47,11 +48,26 @@ def tg(method: str, **params) -> dict:
     data = urllib.parse.urlencode({k: json.dumps(v) if isinstance(v, (dict, list)) else v
                                    for k, v in params.items()}).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        out = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.load(r)
+    except urllib.error.HTTPError as e:   # Telegram explains 4xx in the body
+        try:
+            out = json.loads(e.read())
+        except ValueError:
+            out = {"description": str(e)}
     if not out.get("ok"):
-        raise RuntimeError(f"telegram {method}: {out}")
+        raise RuntimeError(f"telegram {method}: {out.get('description', out)}")
     return out["result"]
+
+
+def safe(method: str, **params) -> dict | None:
+    """A cosmetic Telegram call: log a failure, never let it hide a decision."""
+    try:
+        return tg(method, **params)
+    except Exception as e:
+        log(f"{e}")
+        return None
 
 
 def hive(*args: str) -> tuple[bool, str]:
@@ -131,7 +147,12 @@ def emit(etype: str, gid: str, data: dict | None = None) -> tuple[bool, str]:
     ok, out = hive("emit", etype, "--goal", gid, "--data", json.dumps(data or {}))
     if ok:
         return True, f"{etype} at position {json.loads(out)['position']}"
-    return False, out.splitlines()[-1][:300] if out else "refused"
+    try:   # a refusal comes back as JSON with a code and a reason
+        d = json.loads(out)
+        d = d.get("refusal", {}).get("data", d) if isinstance(d, dict) else {}
+        return False, f"refused: {d.get('code', '?')}: {d.get('reason', out)[:250]}"
+    except ValueError:
+        return False, (out.splitlines()[-1][:300] if out else "refused")
 
 
 def allowed(frm: dict, chat: dict) -> bool:
@@ -141,7 +162,7 @@ def allowed(frm: dict, chat: dict) -> bool:
 def on_callback(cq: dict, st: dict) -> None:
     msg = cq.get("message") or {}
     if not allowed(cq.get("from") or {}, msg.get("chat") or {}):
-        tg("answerCallbackQuery", callback_query_id=cq["id"], text="not allowed")
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="not allowed")
         log(f"refused callback from {cq.get('from', {}).get('id')}")
         return
     action, _, gid = (cq.get("data") or "").partition(":")
@@ -150,21 +171,22 @@ def on_callback(cq: dict, st: dict) -> None:
                parse_mode="HTML", reply_markup={"force_reply": True})
         st["pending_reason"][str(p["message_id"])] = [action, gid]
         save_state(st)
-        tg("answerCallbackQuery", callback_query_id=cq["id"])
+        safe("answerCallbackQuery", callback_query_id=cq["id"])
         return
     etype = {"approve": "goal.approved", "accept": "goal.accepted"}.get(action)
     if not etype:
-        tg("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
         return
     ok, info = emit(etype, gid)
-    tg("answerCallbackQuery", callback_query_id=cq["id"], text=("done" if ok else "refused"))
-    status = f"\n\n{'✅' if ok else '❌'} {esc(info)}"
-    try:
-        tg("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
-           text=(msg.get("text") or "") + status)
-    except RuntimeError:
-        tg("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
     log(f"{action} {gid}: {info}")
+    safe("answerCallbackQuery", callback_query_id=cq["id"], text=("done" if ok else "refused"))
+    status = f"\n\n{'✅' if ok else '❌'} {info}"
+    # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice.
+    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+            text=(msg.get("text") or "") + status) is None:
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+             reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
 
 
 def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:

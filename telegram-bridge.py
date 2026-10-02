@@ -3,7 +3,8 @@
 
 Deterministic, no model. It:
 - pushes each new operator inbox item (goal to approve or accept, escalation,
-  pending exception) once, with buttons;
+  pending exception) with buttons, and again as a reminder while it is still
+  waiting after --remind-hours (so an old request doesn't get buried);
 - turns button taps into signed record events: goal.approved, goal.accepted,
   goal.reopened (asks for the reason as a reply) and goal.abandoned;
 - accepts taps and replies only from the configured chat and user.
@@ -15,7 +16,7 @@ It never reads the operator's main key.
 Free text that isn't a reply to a reason prompt is handed to `--chat-cmd`, if
 given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note.
 
-    telegram-bridge.py [--poll 30] [--inbox-every 60] [--chat-cmd CMD]
+    telegram-bridge.py [--poll 30] [--inbox-every 60] [--remind-hours 12] [--chat-cmd CMD]
 """
 
 from __future__ import annotations
@@ -125,23 +126,32 @@ HEAD = {"goal_proposed": "🆕 Goal to approve", "goal_completed": "🏁 Goal co
         "exception_pending": "⚖️ Exception request", "proposal_pending": "📝 Proposal to decide"}
 
 
+REMIND_S = 12 * 3600
+
+
 def push_inbox(st: dict) -> None:
     ok, out = hive("inbox", "--for", "operator", "--json")
     if not ok:
         log(f"inbox failed: {out}")
         return
+    sent_at = st.setdefault("notified_at", {})
+    now = time.time()
     for item in json.loads(out):
-        if item["key"] in st["notified"]:
+        # Sent before (and recently): skip. Sent long ago, or before sent_at existed: remind.
+        if item["key"] in st["notified"] and now - sent_at.get(item["key"], 0) < REMIND_S:
             continue
-        text = f"{HEAD.get(item['kind'], item['kind'])}\n\n"
+        reminder = item["key"] in st["notified"]
+        text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
         text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
         kb = buttons(item)
         tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML",
            **({"reply_markup": {"inline_keyboard": kb}} if kb else {}))
-        st["notified"].append(item["key"])
+        if not reminder:
+            st["notified"].append(item["key"])
+        sent_at[item["key"]] = now
         save_state(st)
-        log(f"notified {item['key']}")
+        log(f"{'reminded' if reminder else 'notified'} {item['key']}")
 
 
 def emit(etype: str, gid: str, data: dict | None = None) -> tuple[bool, str]:
@@ -227,9 +237,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--poll", type=int, default=30, help="long-poll seconds")
     ap.add_argument("--inbox-every", type=int, default=60)
+    ap.add_argument("--remind-hours", type=float, default=12, help="re-send a request still waiting after this long")
     ap.add_argument("--chat-cmd", default=os.environ.get("TELEGRAM_CHAT_CMD") or None,
                     help="command that reads a message on stdin and prints the reply (default: $TELEGRAM_CHAT_CMD)")
     a = ap.parse_args()
+    global REMIND_S
+    REMIND_S = a.remind_hours * 3600
     st = load_state()
     log("bridge up")
     next_inbox = 0.0

@@ -100,7 +100,8 @@ def goal_text(gid: str) -> str:
     if g.get("objective"):
         parts.append(esc(g["objective"]))
     if g.get("relevance"):
-        parts.append(f"<i>Useless if:</i> {esc(g['relevance'])}")
+        # The goal's relevance line: how the work could pass every check and still miss the point.
+        parts.append(f"<i>Doesn't count, even if every check passes, when:</i> {esc(g['relevance'])}")
     return "\n\n".join(parts)
 
 

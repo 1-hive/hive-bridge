@@ -7,7 +7,11 @@ Deterministic, no model. It:
   waiting after --remind-hours (so an old request doesn't get buried);
 - turns button taps into signed record events: goal.approved, goal.accepted,
   goal.reopened (asks for the reason as a reply) and goal.abandoned;
-- accepts taps and replies only from the configured chat and user.
+- accepts taps and replies only from the configured chat and user;
+- sends the digest (PLAN D15) once a day at --digest-at, local time: per goal, its
+  status, its tasks and anything open, plus what changed since the last digest.
+  Every digest names the next one's time: a digest that doesn't arrive is the alarm
+  that the bridge or the record is down. /digest sends one now.
 
 It signs with its own operator key (~/.config/hive/telegram-bridge.key), registered
 on the operator actor with actor.key_added, and marks events `via: telegram`.
@@ -16,12 +20,13 @@ It never reads the operator's main key.
 Free text that isn't a reply to a reason prompt is handed to `--chat-cmd`, if
 given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note.
 
-    telegram-bridge.py [--poll 30] [--inbox-every 60] [--remind-hours 12] [--chat-cmd CMD]
+    telegram-bridge.py [--poll 30] [--inbox-every 60] [--remind-hours 12] [--digest-at 08:00] [--chat-cmd CMD]
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import subprocess
@@ -154,6 +159,73 @@ def push_inbox(st: dict) -> None:
         log(f"{'reminded' if reminder else 'notified'} {item['key']}")
 
 
+DIGEST_AT = (8, 0)
+OPEN = ("assigned", "in_progress", "blocked", "in_review", "created")
+
+
+def next_digest(after: float) -> dt.datetime:
+    """The first digest time (local) strictly after the epoch time `after`."""
+    t = dt.datetime.fromtimestamp(after).astimezone()
+    d = t.replace(hour=DIGEST_AT[0], minute=DIGEST_AT[1], second=0, microsecond=0)
+    return d if d > t else d + dt.timedelta(days=1)
+
+
+def digest_text(st: dict) -> tuple[str, int] | None:
+    """The digest, deterministic from the record: (text, head position)."""
+    ok, out = hive("state")
+    if not ok:
+        return None
+    state = json.loads(out)
+    since = st.get("digest_pos", 0)
+    ok, out = hive("events", "--after", str(since))
+    events = [json.loads(line) for line in out.splitlines() if line.strip()] if ok else []
+    head = max([e["position"] for e in events], default=since)
+    # The first digest lists only goals in progress, not every goal since the hive began.
+    changed = {e.get("goal") or (state["tasks"].get(e.get("task") or "") or {}).get("goal")
+               for e in events} if "digest_pos" in st else set()
+    tasks_by_goal: dict = {}
+    for t in state.get("tasks", {}).values():
+        tasks_by_goal.setdefault(t.get("goal"), []).append(t)
+    lines = [f"📊 <b>1-hive digest</b> · {dt.datetime.now().astimezone():%a %d %b %H:%M}",
+             f"{len(events)} events since the last digest (now at position {head})."]
+    shown = 0
+    for g in sorted(state.get("goals", {}).values(), key=lambda g: g.get("proposed_at") or ""):
+        live = g["status"] in ("proposed", "active", "completed")
+        if not live and g["id"] not in changed:
+            continue
+        shown += 1
+        ts_ = tasks_by_goal.get(g["id"], [])
+        open_ = [t for t in ts_ if t["status"] in OPEN]
+        line = f"\n<b>{esc(g['title'])}</b> (<code>{g['id']}</code>): {g['status']}"
+        line += f"; tasks {len(ts_) - len(open_)} done, {len(open_)} open"
+        for t in open_:
+            line += f"\n  · <code>{t['id']}</code> {t['status']}"
+            if (t.get("ext") or {}).get("escalation"):
+                line += f", escalated to {t['ext']['escalation'].get('to')}"
+        if g.get("escalation"):
+            line += f"\n  ⚠️ escalated to {g['escalation'].get('to')}: {esc(g['escalation'].get('reason', ''))}"
+        if g.get("budget"):
+            line += f"\n  budget {g['budget']}, spent {g.get('spent')}"
+        lines.append(line)
+    if not shown:
+        lines.append("\nNo goals in progress, and none changed.")
+    nxt = next_digest(time.time())
+    lines.append(f"\nNext digest: {nxt:%a %d %b %H:%M}. If none arrives by then, the bridge or the record is down.")
+    return "\n".join(lines), head
+
+
+def send_digest(st: dict) -> None:
+    d = digest_text(st)
+    if d is None:
+        log("digest: record unreachable")
+        return
+    text, head = d
+    tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML")
+    st["digest_pos"], st["digest_at"] = head, time.time()
+    save_state(st)
+    log(f"digest sent (position {head})")
+
+
 def emit(etype: str, gid: str, data: dict | None = None) -> tuple[bool, str]:
     ok, out = hive("emit", etype, "--goal", gid, "--data", json.dumps(data or {}))
     if ok:
@@ -216,8 +288,12 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         return
     if text in ("/start", "/help"):
         tg("sendMessage", chat_id=ALLOW["chat_id"],
-           text="1-hive: I'll message you when a goal needs approval or acceptance, or something escalates. "
-                "Use the buttons to decide. /inbox lists what's waiting.")
+           text="1-hive: I'll message you when a goal needs approval or acceptance, or something escalates, "
+                "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
+                "/digest sends the digest now.")
+        return
+    if text == "/digest":
+        send_digest(st)
         return
     if text == "/inbox":
         st["notified"] = []          # re-send everything that's still waiting
@@ -238,16 +314,21 @@ def main() -> None:
     ap.add_argument("--poll", type=int, default=30, help="long-poll seconds")
     ap.add_argument("--inbox-every", type=int, default=60)
     ap.add_argument("--remind-hours", type=float, default=12, help="re-send a request still waiting after this long")
+    ap.add_argument("--digest-at", default="08:00", help="daily digest time, HH:MM local")
     ap.add_argument("--chat-cmd", default=os.environ.get("TELEGRAM_CHAT_CMD") or None,
                     help="command that reads a message on stdin and prints the reply (default: $TELEGRAM_CHAT_CMD)")
     a = ap.parse_args()
-    global REMIND_S
+    global REMIND_S, DIGEST_AT
     REMIND_S = a.remind_hours * 3600
+    DIGEST_AT = tuple(int(x) for x in a.digest_at.split(":"))
     st = load_state()
     log("bridge up")
     next_inbox = 0.0
     while True:
         try:
+            # The first run sends one now; afterwards, at each digest time.
+            if time.time() >= next_digest(st.get("digest_at", 0)).timestamp():
+                send_digest(st)
             if time.time() >= next_inbox:
                 push_inbox(st)
                 next_inbox = time.time() + a.inbox_every

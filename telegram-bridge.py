@@ -22,6 +22,10 @@ given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note. Cha
 runs on its own thread, one message at a time, so a slow reply never holds up
 buttons, the inbox or the digest.
 
+Each goal.approved (a tap here or `op approve`) is passed on to the chief of
+staff as a chat message, so it starts the goal without waiting to be asked; its
+one-line reply comes back here.
+
 A tap is acknowledged at once (Telegram drops an answer that comes too late, and
 the user taps again); a second tap on a message already decided does nothing.
 
@@ -324,6 +328,27 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
 CHAT: queue.Queue = queue.Queue()
 
 
+def ping_approvals(st: dict, chat_cmd: str) -> None:
+    """Tell the chief of staff about each goal approved since the last check."""
+    first = "approved_pos" not in st   # first run: skip past approvals, don't replay them
+    ok, out = hive("events", "--after", str(st.get("approved_pos", 0)), "--type", "goal.approved")
+    if not ok:
+        return
+    if first:
+        st["approved_pos"] = max([json.loads(x)["position"] for x in out.splitlines() if x.strip()], default=0)
+        save_state(st)
+        return
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        e = json.loads(line)
+        st["approved_pos"] = max(st["approved_pos"], e["position"])
+        CHAT.put((chat_cmd, f"Goal {e['goal']} was approved (position {e['position']}). Start it now: "
+                            "orders, tasks, assignments. Reply in one line with what you created."))
+        log(f"pinged cos: {e['goal']} approved")
+    save_state(st)
+
+
 def chat_worker() -> None:
     """Chat with the chief of staff, one message at a time, off the main loop."""
     while True:
@@ -365,6 +390,8 @@ def main() -> None:
                 send_digest(st)
             if time.time() >= next_inbox:
                 push_inbox(st)
+                if a.chat_cmd:
+                    ping_approvals(st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every
             for u in tg("getUpdates", offset=st["offset"], timeout=a.poll, allowed_updates=["message", "callback_query"]):
                 st["offset"] = u["update_id"] + 1

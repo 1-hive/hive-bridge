@@ -18,7 +18,12 @@ on the operator actor with actor.key_added, and marks events `via: telegram`.
 It never reads the operator's main key.
 
 Free text that isn't a reply to a reason prompt is handed to `--chat-cmd`, if
-given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note.
+given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note. Chat
+runs on its own thread, one message at a time, so a slow reply never holds up
+buttons, the inbox or the digest.
+
+A tap is acknowledged at once (Telegram drops an answer that comes too late, and
+the user taps again); a second tap on a message already decided does nothing.
 
     telegram-bridge.py [--poll 30] [--inbox-every 60] [--remind-hours 12] [--digest-at 08:00] [--chat-cmd CMD]
 """
@@ -30,7 +35,9 @@ import datetime as dt
 import json
 import os
 import subprocess
+import queue
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -249,6 +256,10 @@ def on_callback(cq: dict, st: dict) -> None:
         log(f"refused callback from {cq.get('from', {}).get('id')}")
         return
     action, _, gid = (cq.get("data") or "").partition(":")
+    key = f"{msg.get('message_id')}:{action}"
+    if key in st.setdefault("decided", []):
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="already done")
+        return
     if action in ("reopen", "abandon"):
         p = tg("sendMessage", chat_id=ALLOW["chat_id"], text=f"Reason to {action} <code>{esc(gid)}</code>? Reply to this message.",
                parse_mode="HTML", reply_markup={"force_reply": True})
@@ -260,9 +271,11 @@ def on_callback(cq: dict, st: dict) -> None:
     if not etype:
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
         return
+    safe("answerCallbackQuery", callback_query_id=cq["id"])
     ok, info = emit(etype, gid)
     log(f"{action} {gid}: {info}")
-    safe("answerCallbackQuery", callback_query_id=cq["id"], text=("done" if ok else "refused"))
+    st["decided"] = (st["decided"] + [key])[-200:]
+    save_state(st)
     status = f"\n\n{'✅' if ok else '❌'} {info}"
     # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice.
     if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
@@ -300,13 +313,33 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         push_inbox(st)
         return
     if chat_cmd:
-        r = subprocess.run(chat_cmd, shell=True, input=text, capture_output=True, text=True, timeout=900)
-        reply = (r.stdout or r.stderr or "(no reply)").strip()
-        for i in range(0, len(reply), 3900):
-            tg("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
+        if CHAT.unfinished_tasks:
+            safe("sendMessage", chat_id=ALLOW["chat_id"], text="(queued: the chief of staff is still on your last message)")
+        CHAT.put((chat_cmd, text))
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
+
+
+CHAT: queue.Queue = queue.Queue()
+
+
+def chat_worker() -> None:
+    """Chat with the chief of staff, one message at a time, off the main loop."""
+    while True:
+        cmd, text = CHAT.get()
+        try:
+            safe("sendChatAction", chat_id=ALLOW["chat_id"], action="typing")
+            r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
+            reply = (r.stdout or r.stderr or "(no reply)").strip()
+        except subprocess.TimeoutExpired:
+            reply = "(the chief of staff didn't answer in 16 minutes; try again)"
+        except Exception as e:
+            reply = f"(chat failed: {e})"
+        log(f"chat: {len(text)} chars in, {len(reply)} out")
+        for i in range(0, len(reply), 3900):
+            safe("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
+        CHAT.task_done()
 
 
 def main() -> None:
@@ -322,6 +355,7 @@ def main() -> None:
     REMIND_S = a.remind_hours * 3600
     DIGEST_AT = tuple(int(x) for x in a.digest_at.split(":"))
     st = load_state()
+    threading.Thread(target=chat_worker, daemon=True).start()
     log("bridge up")
     next_inbox = 0.0
     while True:

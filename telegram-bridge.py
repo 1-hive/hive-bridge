@@ -384,12 +384,15 @@ PINGS = {   # record event -> (state cursor, message to the chief of staff, or N
                        f"Task {e['task']} was escalated to you (position {e['position']}, "
                        f"{e['data'].get('code')}): {e['data'].get('reason', '')}. Handle it as your doc says "
                        "and resolve it on the record. Reply in one line with what you did, or what the human must decide."),
+    "review.recorded": ("reviewed_pos", lambda e: None if (e.get("data") or {}).get("verdict") != "passed" else
+                        f"Task {e['task']} passed its review (position {e['position']}). Read the review, close "
+                        "the task, and complete the goal if it was the last one. Reply in one line with what you did."),
 }
 
 
 def ping_cos(st: dict, chat_cmd: str) -> None:
-    """Tell the chief of staff about each goal approved, and each escalation to it, since the last
-    check: nothing else wakes it."""
+    """Tell the chief of staff about each goal approved, each escalation to it and each passed
+    review, since the last check: nothing else wakes it."""
     for etype, (cursor, text) in PINGS.items():
         first = cursor not in st   # first run: skip past events, don't replay them
         ok, out = hive("events", "--after", str(st.get(cursor, 0)), "--type", etype)

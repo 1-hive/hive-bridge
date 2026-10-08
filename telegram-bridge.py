@@ -26,9 +26,8 @@ Each goal.approved (a tap here or `op approve`), escalation to the chief of staf
 and passed review is passed on to it as a chat message, so it acts without waiting
 to be asked; its one-line reply comes back here.
 
-Milestones are pushed as one-line notes, without buttons (`--no-feed` turns them off):
-a task started, a result posted, a review's verdict, a restart, an escalation, a task
-closed or cancelled, a goal completed.
+When a task is done (closed or cancelled), a one-line note is pushed, without buttons
+(`--no-feed` turns them off). A completed goal already arrives as an inbox item.
 
 A tap is acknowledged at once (Telegram drops an answer that comes too late, and
 the user taps again); a second tap on a message already decided does nothing.
@@ -415,21 +414,14 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
-FEED = {   # record event -> one line for the operator
-    "task.accepted": lambda e, d: "▶️ started",
-    "task.result_posted": lambda e, d: "📦 result posted, review next",
-    "review.recorded": lambda e, d: {"passed": "✅ review passed", "failed": "❌ review failed: the worker reworks it"}
-                                    .get(d.get("verdict"), f"review: {d.get('verdict')}"),
-    "task.restarted": lambda e, d: f"🔁 restarted: {d.get('reason', '')}",
-    "task.escalated": lambda e, d: f"⚠️ escalated to {d.get('to')}: {d.get('reason', '')}",
-    "task.closed": lambda e, d: "🏁 closed",
+FEED = {   # record event -> one line for the operator: only work that is done
+    "task.closed": lambda e, d: "✅ done",
     "task.cancelled": lambda e, d: f"✖️ cancelled: {d.get('reason', '')}",
-    "goal.completed": lambda e, d: "🏁 goal completed, waiting for your acceptance",
 }
 
 
 def push_feed(st: dict) -> None:
-    """One line per milestone since the last check; the first run starts at the head."""
+    """One line per task done since the last check; the first run starts at the head."""
     ok, out = hive("events", "--after", str(st.get("feed_pos", 0)))
     if not ok:
         return
@@ -442,7 +434,7 @@ def push_feed(st: dict) -> None:
     for e in evs:
         st["feed_pos"] = max(st["feed_pos"], e["position"])
         f = FEED.get(e["type"])
-        if f and not (e["type"] == "task.accepted" and e["actor"]["class"] != "worker"):
+        if f:
             t = time.strftime("%H:%M", time.localtime(dt.datetime.fromisoformat(
                 e["recorded_at"].replace("Z", "+00:00")).timestamp()))
             lines.append(f"{t} <b>{esc(e.get('task') or e.get('goal') or '')}</b> {esc(f(e, e.get('data') or {})[:200])}")
@@ -476,7 +468,7 @@ def main() -> None:
     ap.add_argument("--inbox-every", type=int, default=60)
     ap.add_argument("--remind-hours", type=float, default=12, help="re-send a request still waiting after this long")
     ap.add_argument("--digest-at", default="08:00", help="daily digest time, HH:MM local")
-    ap.add_argument("--no-feed", action="store_true", help="don't push milestone notes")
+    ap.add_argument("--no-feed", action="store_true", help="don't push a note when a task is done")
     ap.add_argument("--chat-cmd", default=os.environ.get("TELEGRAM_CHAT_CMD") or None,
                     help="command that reads a message on stdin and prints the reply (default: $TELEGRAM_CHAT_CMD)")
     a = ap.parse_args()

@@ -22,9 +22,13 @@ given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note. Cha
 runs on its own thread, one message at a time, so a slow reply never holds up
 buttons, the inbox or the digest.
 
-Each goal.approved (a tap here or `op approve`) is passed on to the chief of
-staff as a chat message, so it starts the goal without waiting to be asked; its
-one-line reply comes back here.
+Each goal.approved (a tap here or `op approve`), escalation to the chief of staff
+and passed review is passed on to it as a chat message, so it acts without waiting
+to be asked; its one-line reply comes back here.
+
+Milestones are pushed as one-line notes, without buttons (`--no-feed` turns them off):
+a task started, a result posted, a review's verdict, a restart, an escalation, a task
+closed or cancelled, a goal completed.
 
 A tap is acknowledged at once (Telegram drops an answer that comes too late, and
 the user taps again); a second tap on a message already decided does nothing.
@@ -411,6 +415,43 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
+FEED = {   # record event -> one line for the operator
+    "task.accepted": lambda e, d: "▶️ started",
+    "task.result_posted": lambda e, d: "📦 result posted, review next",
+    "review.recorded": lambda e, d: {"passed": "✅ review passed", "failed": "❌ review failed: the worker reworks it"}
+                                    .get(d.get("verdict"), f"review: {d.get('verdict')}"),
+    "task.restarted": lambda e, d: f"🔁 restarted: {d.get('reason', '')}",
+    "task.escalated": lambda e, d: f"⚠️ escalated to {d.get('to')}: {d.get('reason', '')}",
+    "task.closed": lambda e, d: "🏁 closed",
+    "task.cancelled": lambda e, d: f"✖️ cancelled: {d.get('reason', '')}",
+    "goal.completed": lambda e, d: "🏁 goal completed, waiting for your acceptance",
+}
+
+
+def push_feed(st: dict) -> None:
+    """One line per milestone since the last check; the first run starts at the head."""
+    ok, out = hive("events", "--after", str(st.get("feed_pos", 0)))
+    if not ok:
+        return
+    evs = [json.loads(x) for x in out.splitlines() if x.strip()]
+    if "feed_pos" not in st:
+        st["feed_pos"] = max([e["position"] for e in evs], default=0)
+        save_state(st)
+        return
+    lines = []
+    for e in evs:
+        st["feed_pos"] = max(st["feed_pos"], e["position"])
+        f = FEED.get(e["type"])
+        if f and not (e["type"] == "task.accepted" and e["actor"]["class"] != "worker"):
+            t = time.strftime("%H:%M", time.localtime(dt.datetime.fromisoformat(
+                e["recorded_at"].replace("Z", "+00:00")).timestamp()))
+            lines.append(f"{t} <b>{esc(e.get('task') or e.get('goal') or '')}</b> {esc(f(e, e.get('data') or {})[:200])}")
+    if lines:
+        tg("sendMessage", chat_id=ALLOW["chat_id"], text="\n".join(lines), parse_mode="HTML")
+        log(f"feed: {len(lines)} lines")
+    save_state(st)
+
+
 def chat_worker() -> None:
     """Chat with the chief of staff, one message at a time, off the main loop."""
     while True:
@@ -435,6 +476,7 @@ def main() -> None:
     ap.add_argument("--inbox-every", type=int, default=60)
     ap.add_argument("--remind-hours", type=float, default=12, help="re-send a request still waiting after this long")
     ap.add_argument("--digest-at", default="08:00", help="daily digest time, HH:MM local")
+    ap.add_argument("--no-feed", action="store_true", help="don't push milestone notes")
     ap.add_argument("--chat-cmd", default=os.environ.get("TELEGRAM_CHAT_CMD") or None,
                     help="command that reads a message on stdin and prints the reply (default: $TELEGRAM_CHAT_CMD)")
     a = ap.parse_args()
@@ -452,6 +494,8 @@ def main() -> None:
                 send_digest(st)
             if time.time() >= next_inbox:
                 push_inbox(st)
+                if not a.no_feed:
+                    push_feed(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every

@@ -377,24 +377,34 @@ def board_text() -> str:
 CHAT: queue.Queue = queue.Queue()
 
 
-def ping_approvals(st: dict, chat_cmd: str) -> None:
-    """Tell the chief of staff about each goal approved since the last check."""
-    first = "approved_pos" not in st   # first run: skip past approvals, don't replay them
-    ok, out = hive("events", "--after", str(st.get("approved_pos", 0)), "--type", "goal.approved")
-    if not ok:
-        return
-    if first:
-        st["approved_pos"] = max([json.loads(x)["position"] for x in out.splitlines() if x.strip()], default=0)
-        save_state(st)
-        return
-    for line in out.splitlines():
-        if not line.strip():
+PINGS = {   # record event -> (state cursor, message to the chief of staff, or None to skip it)
+    "goal.approved": ("approved_pos", lambda e: f"Goal {e['goal']} was approved (position {e['position']}). "
+                      "Start it now: orders, tasks, assignments. Reply in one line with what you created."),
+    "task.escalated": ("escalated_pos", lambda e: None if (e.get("data") or {}).get("to") != "chief_of_staff" else
+                       f"Task {e['task']} was escalated to you (position {e['position']}, "
+                       f"{e['data'].get('code')}): {e['data'].get('reason', '')}. Handle it as your doc says "
+                       "and resolve it on the record. Reply in one line with what you did, or what the human must decide."),
+}
+
+
+def ping_cos(st: dict, chat_cmd: str) -> None:
+    """Tell the chief of staff about each goal approved, and each escalation to it, since the last
+    check: nothing else wakes it."""
+    for etype, (cursor, text) in PINGS.items():
+        first = cursor not in st   # first run: skip past events, don't replay them
+        ok, out = hive("events", "--after", str(st.get(cursor, 0)), "--type", etype)
+        if not ok:
             continue
-        e = json.loads(line)
-        st["approved_pos"] = max(st["approved_pos"], e["position"])
-        CHAT.put((chat_cmd, f"Goal {e['goal']} was approved (position {e['position']}). Start it now: "
-                            "orders, tasks, assignments. Reply in one line with what you created."))
-        log(f"pinged cos: {e['goal']} approved")
+        evs = [json.loads(x) for x in out.splitlines() if x.strip()]
+        if first:
+            st[cursor] = max([e["position"] for e in evs], default=0)
+            continue
+        for e in evs:
+            st[cursor] = max(st[cursor], e["position"])
+            msg = text(e)
+            if msg:
+                CHAT.put((chat_cmd, msg))
+                log(f"pinged cos: {etype} {e.get('goal') or e.get('task')}")
     save_state(st)
 
 
@@ -440,7 +450,7 @@ def main() -> None:
             if time.time() >= next_inbox:
                 push_inbox(st)
                 if a.chat_cmd:
-                    ping_approvals(st, a.chat_cmd)
+                    ping_cos(st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every
             for u in tg("getUpdates", offset=st["offset"], timeout=a.poll, allowed_updates=["message", "callback_query"]):
                 st["offset"] = u["update_id"] + 1

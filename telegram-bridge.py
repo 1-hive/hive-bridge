@@ -307,7 +307,10 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="1-hive: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
-                "/digest sends the digest now.")
+                "/digest sends the digest now; /board shows what each agent is doing.")
+        return
+    if text == "/board":
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=board_text(), parse_mode="HTML")
         return
     if text == "/digest":
         send_digest(st)
@@ -323,6 +326,52 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
+
+
+FLOOR = os.environ.get("FLOOR_URL", "http://127.0.0.1:8476")
+
+
+def ago(s: float) -> str:
+    s = int(s)
+    return f"{s // 60}m" if s < 5400 else f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def board_text() -> str:
+    """Open goals and tasks, with what each agent is doing now (from the Floor, tools/floor.py)."""
+    try:
+        with urllib.request.urlopen(f"{FLOOR}/api/state", timeout=10) as r:
+            st = json.load(r)
+        with urllib.request.urlopen(f"{FLOOR}/api/live", timeout=10) as r:
+            live = json.load(r)["live"]
+    except Exception as e:
+        return f"The Floor isn't answering ({esc(str(e))[:120]}). Check: systemctl --user status 1-hive-floor"
+    lines = []
+    for g in st["goals"].values():
+        if g["status"] not in ("proposed", "active", "completed"):
+            continue
+        head = f"<b>{esc(g['title'])}</b> · {g['status']}"
+        wall = (g.get("budget") or {}).get("wall_clock_seconds")
+        if wall and g.get("approved_at") and g["status"] == "active":
+            used = time.time() - dt.datetime.fromisoformat(g["approved_at"].replace("Z", "+00:00")).timestamp()
+            head += f" · {ago(used)} of {ago(wall)}"
+        lines.append(head)
+        for t in st["tasks"].values():
+            if t["goal"] != g["id"] or t["status"] in ("done", "released"):
+                continue
+            L = live.get(t["id"]) or {}
+            line = f"  <code>{esc(t['id'])}</code> {t['status'].replace('_', ' ')}"
+            if L.get("waiting_reviewer"):
+                line += f" · waiting for {esc(t.get('reviewer') or 'a reviewer')}"
+                if L.get("since_s") is not None:
+                    line += f", {ago(L['since_s'])}"
+            elif L.get("finished"):
+                line += f" · {L.get('role', 'agent')} finished {ago(L['idle_s'])} ago"
+            elif L:
+                call = (L.get("calls") or [[None, "", ""]])[-1]
+                line += f" · {esc(call[1])} {esc(call[2])[:60]}"
+                line += " · active now" if L["idle_s"] < 60 else f" · quiet {ago(L['idle_s'])}"
+            lines.append(line)
+    return "\n".join(lines) or "Nothing open."
 
 
 CHAT: queue.Queue = queue.Queue()

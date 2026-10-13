@@ -184,6 +184,14 @@ def next_digest(after: float) -> dt.datetime:
     return d if d > t else d + dt.timedelta(days=1)
 
 
+def sweeps_since(t: float) -> tuple[int, int] | None:
+    """Task folders the sweeper removed since time t (tools/sweeper.py): (count, bytes)."""
+    f = Path.home() / "work" / "1hive" / ".sweeper" / "log.jsonl"
+    rows = [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+    rows = [r for r in rows if dt.datetime.fromisoformat(r["at"].replace("Z", "+00:00")).timestamp() > t]
+    return (len(rows), sum(r["bytes"] for r in rows)) if rows else None
+
+
 def digest_text(st: dict) -> tuple[str, int] | None:
     """The digest, deterministic from the record: (text, head position)."""
     ok, out = hive("state")
@@ -223,6 +231,9 @@ def digest_text(st: dict) -> tuple[str, int] | None:
         lines.append(line)
     if not shown:
         lines.append("\nNo goals in progress, and none changed.")
+    swept = sweeps_since(st.get("digest_at", 0))
+    if swept:
+        lines.append(f"\nDisk: freed {swept[1] / 1e9:.1f} GB from {swept[0]} task folders.")
     nxt = next_digest(time.time())
     lines.append(f"\nNext digest: {nxt:%a %d %b %H:%M}. If none arrives by then, the bridge or the record is down.")
     return "\n".join(lines), head

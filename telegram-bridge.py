@@ -33,6 +33,13 @@ the bridge wakes it at that time and forwards the reply. Only a file written wit
 16 minutes of an operator message counts (so the chief of staff can't start pushes
 on its own), at most 2 hours ahead and 3 pending (1-hive PLAN D15, 2026-10-14).
 
+A chat reply may carry attachments: a line of its own `[[photo: <path>]]` or `[[file: <path>]]`,
+the path inside the chief of staff's workspace clone (relative, or under /cos/workspace). The
+line is taken out of the text and the file sent with sendPhoto or sendDocument: at most 5 per
+reply, 10 MB each, never a file outside that clone (symlinks resolved), only listed types.
+
+The digest lists results waiting more than an hour for a verdict, with what the review is doing.
+
 An over-budget alert carries a "+4h" button: it raises the goal's wall-clock budget
 to 4 hours from now (`op budget` does the same) and resolves the alert.
 
@@ -53,6 +60,7 @@ import json
 import os
 import subprocess
 import queue
+import re
 import sys
 import threading
 import time
@@ -209,6 +217,35 @@ def sweeps_since(t: float) -> tuple[int, int] | None:
 
 
 WORKSPACE = Path("/home/omegahive/repos/hive-workspace.git")
+SLOW_REVIEW_S = 3600
+
+
+def slow_reviews(state: dict) -> list[str]:
+    """Tasks in review whose current result has waited over SLOW_REVIEW_S for a verdict, each with
+    what its review is doing (from the Floor; tools/floor.py)."""
+    try:
+        with urllib.request.urlopen(f"{FLOOR}/api/live", timeout=10) as r:
+            live = json.load(r)["live"]
+    except Exception:
+        live = None
+    out = []
+    for t in state.get("tasks", {}).values():
+        cur = t.get("current_result") or {}
+        if t["status"] != "in_review" or not cur.get("at"):
+            continue
+        if (t.get("latest_review") or {}).get("position", 0) > cur.get("position", 0):
+            continue
+        waited = time.time() - dt.datetime.fromisoformat(cur["at"].replace("Z", "+00:00")).timestamp()
+        if waited < SLOW_REVIEW_S:
+            continue
+        L = (live or {}).get(t["id"]) or {}
+        doing = ("status unknown (the Floor isn't answering)" if live is None
+                 else f"waiting for {t.get('assigned_reviewer') or 'a reviewer'} to start" if L.get("waiting_reviewer")
+                 else "the reviewer finished without a verdict" if L.get("finished")
+                 else f"the reviewer is working (quiet {ago(L['idle_s'])})" if L
+                 else "no reviewer running")
+        out.append(f"<code>{esc(t['id'])}</code>: {ago(waited)}, {esc(doing)}")
+    return out
 
 
 def open_requests() -> list[str]:
@@ -261,6 +298,9 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     swept = sweeps_since(st.get("digest_at", 0))
     if swept:
         lines.append(f"\nDisk: freed {swept[1] / 1e9:.1f} GB from {swept[0]} task folders.")
+    slow = slow_reviews(state)
+    if slow:
+        lines.append("\nWaiting over an hour for a review verdict:" + "".join(f"\n  · {x}" for x in slow))
     reqs = open_requests()
     if reqs:
         lines.append(f"\nOpen requests from the chief of staff (hive-requests/): {len(reqs)}"
@@ -555,6 +595,84 @@ def last_human_turn() -> float:
         return 0.0
 
 
+COS_WORKSPACE = Path.home() / "work" / "1hive" / "cos" / "workspace"
+ATTACH_MAX, ATTACH_BYTES = 5, 10 * 1024 * 1024
+PHOTO_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
+FILE_TYPES = PHOTO_TYPES | {".gif", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html"}
+ATTACH_LINE = re.compile(r"^\s*\[\[(photo|file):\s*(.+?)\s*\]\]\s*$", re.I)
+
+
+def split_attachments(reply: str) -> tuple[str, list[tuple[str, str]]]:
+    """The reply without its attachment lines, and the (kind, path) of each."""
+    keep, found = [], []
+    for line in reply.splitlines():
+        m = ATTACH_LINE.match(line)
+        if m:
+            found.append((m.group(1).lower(), m.group(2)))
+        else:
+            keep.append(line)
+    return "\n".join(keep).strip(), found
+
+
+def attachment(raw: str) -> Path:
+    """The file a chat reply names, only if it is inside the chief of staff's workspace clone."""
+    rel = raw.strip("`'\"")
+    if rel.startswith("/cos/workspace/"):
+        rel = rel[len("/cos/workspace/"):]
+    if rel.startswith("/"):
+        raise ValueError("only paths inside the workspace")
+    base = COS_WORKSPACE.resolve()
+    f = (base / rel).resolve()
+    if not f.is_relative_to(base) or ".git" in f.relative_to(base).parts:
+        raise ValueError("outside the workspace")
+    if f.suffix.lower() not in FILE_TYPES:
+        raise ValueError(f"type {f.suffix or '(none)'} not allowed")
+    if not f.is_file():
+        raise ValueError("no such file")
+    if f.stat().st_size > ATTACH_BYTES:
+        raise ValueError("over 10 MB")
+    return f
+
+
+def tg_file(method: str, field: str, f: Path, **params) -> dict:
+    """A Telegram call with one file upload (multipart/form-data)."""
+    boundary = f"----1hive{os.urandom(8).hex()}"
+    body = b""
+    for k, v in params.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{f.name}\"\r\n"
+             f"Content-Type: application/octet-stream\r\n\r\n").encode() + f.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            out = json.load(r)
+    except urllib.error.HTTPError as e:
+        out = json.loads(e.read() or b"{}")
+    if not out.get("ok"):
+        raise RuntimeError(f"telegram {method}: {out.get('description', out)}")
+    return out["result"]
+
+
+def send_attachments(found: list[tuple[str, str]]) -> list[str]:
+    """Send each named file; return a note for each that couldn't be sent."""
+    notes = []
+    for i, (kind, raw) in enumerate(found):
+        if i >= ATTACH_MAX:
+            notes.append(f"(not attached, over {ATTACH_MAX} per reply: {raw})")
+            continue
+        try:
+            f = attachment(raw)
+            photo = kind == "photo" and f.suffix.lower() in PHOTO_TYPES
+            tg_file("sendPhoto" if photo else "sendDocument", "photo" if photo else "document", f,
+                    chat_id=ALLOW["chat_id"], caption=f.name)
+            log(f"chat: attached {f}")
+        except Exception as e:
+            notes.append(f"(couldn't attach {raw}: {e})")
+            log(f"chat: attachment {raw!r} refused: {e}")
+    return notes
+
+
 NOOP = ("no response requested", "no reply needed", "no response needed", "nothing to add", "(no reply)")
 
 
@@ -609,12 +727,17 @@ def chat_worker() -> None:
         except Exception as e:
             reply = f"(chat failed: {e})"
         log(f"chat: {len(text)} chars in, {len(reply)} out")
-        if is_noop(reply):
+        reply, found = split_attachments(reply)
+        if is_noop(reply) and not found:
             log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
             CHAT.task_done()
             continue
-        for i in range(0, len(reply), 3900):
-            safe("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
+        if not is_noop(reply):
+            for i in range(0, len(reply), 3900):
+                safe("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
+        notes = send_attachments(found)
+        if notes:
+            safe("sendMessage", chat_id=ALLOW["chat_id"], text="\n".join(notes))
         CHAT.task_done()
 
 

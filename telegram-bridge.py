@@ -22,9 +22,19 @@ given (the chief of staff; 1-hive PLAN D15); otherwise it gets a short note. Cha
 runs on its own thread, one message at a time, so a slow reply never holds up
 buttons, the inbox or the digest.
 
-Each goal.approved (a tap here or `op approve`), escalation to the chief of staff
-and passed review is passed on to it as a chat message, so it acts without waiting
-to be asked; its one-line reply comes back here.
+Each goal.approved (a tap here or `op approve`), escalation to the chief of staff,
+blocked task (a worker's question) and passed review is passed on to it as a chat
+message, so it acts without waiting to be asked; its one-line reply comes back here.
+A reply that says nothing ("No response requested.") isn't forwarded.
+
+Follow-ups the operator asks for ("check in 10 minutes and tell me"): the chief of
+staff writes a file into its folder `followups/` while answering the operator, and
+the bridge wakes it at that time and forwards the reply. Only a file written within
+16 minutes of an operator message counts (so the chief of staff can't start pushes
+on its own), at most 2 hours ahead and 3 pending (1-hive PLAN D15, 2026-10-14).
+
+An over-budget alert carries a "+4h" button: it raises the goal's wall-clock budget
+to 4 hours from now (`op budget` does the same) and resolves the alert.
 
 When a task is done (closed or cancelled), a one-line note is pushed, without buttons
 (`--no-feed` turns them off). A completed goal already arrives as an inbox item.
@@ -140,6 +150,12 @@ def buttons(item: dict) -> list:
     return []
 
 
+def budget_kb(item: dict) -> list:
+    if item["kind"] == "escalation_open" and item["entity"] == "goal" and item["title"].startswith("budget_exceeded"):
+        return [[{"text": "⏱ +4h", "callback_data": f"budget:{item['id']}:4"}]]
+    return []
+
+
 HEAD = {"goal_proposed": "🆕 Goal to approve", "goal_completed": "🏁 Goal completed: accept or reopen",
         "escalation_open": "⚠️ Escalation", "goal_abandoned_open_tasks": "🧹 Abandoned goal with open tasks",
         "exception_pending": "⚖️ Exception request", "proposal_pending": "📝 Proposal to decide"}
@@ -163,7 +179,7 @@ def push_inbox(st: dict) -> None:
         text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
         text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
-        kb = buttons(item)
+        kb = buttons(item) or budget_kb(item)
         tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML",
            **({"reply_markup": {"inline_keyboard": kb}} if kb else {}))
         if not reminder:
@@ -190,6 +206,17 @@ def sweeps_since(t: float) -> tuple[int, int] | None:
     rows = [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
     rows = [r for r in rows if dt.datetime.fromisoformat(r["at"].replace("Z", "+00:00")).timestamp() > t]
     return (len(rows), sum(r["bytes"] for r in rows)) if rows else None
+
+
+WORKSPACE = Path("/home/omegahive/repos/hive-workspace.git")
+
+
+def open_requests() -> list[str]:
+    """The chief of staff's requests for hive changes, on the workspace's main: hive-requests/*.md
+    not yet moved into hive-requests/done/."""
+    r = subprocess.run(["git", "-C", str(WORKSPACE), "ls-tree", "--name-only", "main", "hive-requests/"],
+                       capture_output=True, text=True)
+    return [Path(x).stem for x in r.stdout.split() if x.endswith(".md")] if r.returncode == 0 else []
 
 
 def digest_text(st: dict) -> tuple[str, int] | None:
@@ -234,6 +261,10 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     swept = sweeps_since(st.get("digest_at", 0))
     if swept:
         lines.append(f"\nDisk: freed {swept[1] / 1e9:.1f} GB from {swept[0]} task folders.")
+    reqs = open_requests()
+    if reqs:
+        lines.append(f"\nOpen requests from the chief of staff (hive-requests/): {len(reqs)}"
+                     + "".join(f"\n  · {esc(r)}" for r in reqs))
     nxt = next_digest(time.time())
     lines.append(f"\nNext digest: {nxt:%a %d %b %H:%M}. If none arrives by then, the bridge or the record is down.")
     return "\n".join(lines), head
@@ -263,6 +294,24 @@ def emit(etype: str, gid: str, data: dict | None = None) -> tuple[bool, str]:
         return False, (out.splitlines()[-1][:300] if out else "refused")
 
 
+def extend_budget(gid: str, hours: float, via: str) -> tuple[bool, str]:
+    """Set the goal's wall-clock budget to `hours` from now, keeping its other dimensions,
+    and resolve an open over-budget alert (the same as `op budget`)."""
+    ok, out = hive("state")
+    if not ok:
+        return False, "record unreachable"
+    g = json.loads(out)["goals"].get(gid)
+    if not g or not g.get("approved_at"):
+        return False, f"{gid}: no such approved goal"
+    used = time.time() - dt.datetime.fromisoformat(g["approved_at"].replace("Z", "+00:00")).timestamp()
+    budget = {**(g.get("budget") or {}), "wall_clock_seconds": int(used + hours * 3600)}
+    ok, info = emit("goal.revised", gid, {"reason": f"{hours:g} more hours (operator, via {via})", "budget": budget})
+    if ok and (g.get("escalation") or {}).get("code") == "budget_exceeded":
+        ok, more = emit("goal.escalation_resolved", gid, {"resolution": f"Budget raised: {hours:g} more hours"})
+        info += f"; {more}"
+    return ok, info
+
+
 def allowed(frm: dict, chat: dict) -> bool:
     return frm.get("id") == ALLOW["user_id"] and chat.get("id") == ALLOW["chat_id"]
 
@@ -286,6 +335,17 @@ def on_callback(cq: dict, st: dict) -> None:
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         return
     etype = {"approve": "goal.approved", "accept": "goal.accepted"}.get(action)
+    if action == "budget":
+        gid, _, hours = gid.rpartition(":")
+        safe("answerCallbackQuery", callback_query_id=cq["id"])
+        ok, info = extend_budget(gid, float(hours), "telegram")
+        log(f"budget {gid} +{hours}h: {info}")
+        st["decided"] = (st["decided"] + [key])[-200:]
+        save_state(st)
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+             reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"{'✅' if ok else '❌'} {info}")
+        return
     if not etype:
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
         return
@@ -336,7 +396,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat_cmd:
         if CHAT.unfinished_tasks:
             safe("sendMessage", chat_id=ALLOW["chat_id"], text="(queued: the chief of staff is still on your last message)")
-        CHAT.put((chat_cmd, text))
+        CHAT.put((chat_cmd, text, True))
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
@@ -388,7 +448,7 @@ def board_text() -> str:
     return "\n".join(lines) or "Nothing open."
 
 
-CHAT: queue.Queue = queue.Queue()
+CHAT: queue.Queue = queue.Queue()   # (command, message, from the operator?)
 
 
 PINGS = {   # record event -> (state cursor, message to the chief of staff, or None to skip it)
@@ -398,6 +458,10 @@ PINGS = {   # record event -> (state cursor, message to the chief of staff, or N
                        f"Task {e['task']} was escalated to you (position {e['position']}, "
                        f"{e['data'].get('code')}): {e['data'].get('reason', '')}. Handle it as your doc says "
                        "and resolve it on the record. Reply in one line with what you did, or what the human must decide."),
+    "task.blocked": ("blocked_pos", lambda e: f"Task {e['task']} is blocked with a question for you "
+                     f"(position {e['position']}, needs {(e.get('data') or {}).get('needs')}): "
+                     f"{(e.get('data') or {}).get('reason', '')[:300]} Read the question, then answer it with a file in "
+                     "questions/ and task.answered, or tell the human what they must decide. Reply in one line."),
     "review.recorded": ("reviewed_pos", lambda e: None if (e.get("data") or {}).get("verdict") != "passed" else
                         f"Task {e['task']} passed its review (position {e['position']}). Read the review, close "
                         "the task, and complete the goal if it was the last one. Reply in one line with what you did."),
@@ -420,9 +484,84 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
             st[cursor] = max(st[cursor], e["position"])
             msg = text(e)
             if msg:
-                CHAT.put((chat_cmd, msg))
+                CHAT.put((chat_cmd, msg, False))
                 log(f"pinged cos: {etype} {e.get('goal') or e.get('task')}")
     save_state(st)
+
+
+FOLLOWUPS = Path.home() / "work" / "1hive" / "cos" / "followups"
+FOLLOWUP_WINDOW_S, FOLLOWUP_AHEAD_S, FOLLOWUP_MAX = 16 * 60, 2 * 3600, 3
+
+
+def check_followups(chat_cmd: str) -> None:
+    """Wake the chief of staff for each follow-up the operator asked for that is due.
+    A file `followups/<name>.json` is JSON {"at": "<ISO time>", "note": "<what to check>"}. On first
+    sight it is accepted (renamed `<name>.ok`) only if written within FOLLOWUP_WINDOW_S of the start
+    of a turn on an operator message, for at most FOLLOWUP_AHEAD_S ahead, with fewer than
+    FOLLOWUP_MAX pending; otherwise it is deleted. Accepted ones are sent when due."""
+    try:
+        pending = sorted(FOLLOWUPS.glob("*.ok"))
+        new = sorted(FOLLOWUPS.glob("*.json"), key=lambda f: f.stat().st_mtime)
+    except OSError as e:
+        log(f"followups: {e}")
+        return
+    human = last_human_turn()
+    for f in new:
+        try:
+            made = f.stat().st_mtime
+            at = followup_at(f)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log(f"followup {f.name} dropped: {e}")
+            f.unlink(missing_ok=True)
+            continue
+        why = ("not written while answering the operator" if not human <= made <= human + FOLLOWUP_WINDOW_S
+               else "more than 2 hours ahead" if at > made + FOLLOWUP_AHEAD_S
+               else "too many pending" if len(pending) >= FOLLOWUP_MAX else None)
+        if why:
+            log(f"followup {f.name} refused: {why}")
+            f.unlink(missing_ok=True)
+            continue
+        ok = f.with_suffix(".ok")
+        f.rename(ok)
+        pending.append(ok)
+        log(f"followup {f.name} accepted for {time.strftime('%H:%M', time.localtime(at))}")
+    for f in pending:
+        try:
+            at, note = followup_at(f), str(json.loads(f.read_text()).get("note", ""))[:500]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log(f"followup {f.name} dropped: {e}")
+            f.unlink(missing_ok=True)
+            continue
+        if at > time.time():
+            continue
+        f.unlink(missing_ok=True)
+        CHAT.put((chat_cmd, f"The follow-up the human asked for is due ({time.strftime('%H:%M', time.localtime(at))}): "
+                            f"{note} Check it now and reply in one line with what you found.", False))
+        log(f"requested follow-up: {f.name}")
+
+
+def followup_at(f: Path) -> float:
+    at = dt.datetime.fromisoformat(json.loads(f.read_text())["at"].replace("Z", "+00:00"))
+    return (at if at.tzinfo else at.astimezone()).timestamp()
+
+
+HUMAN_TURN = STATE.parent / "last-human-turn"
+
+
+def last_human_turn() -> float:
+    try:
+        return float(HUMAN_TURN.read_text())
+    except (OSError, ValueError):
+        return 0.0
+
+
+NOOP = ("no response requested", "no reply needed", "no response needed", "nothing to add", "(no reply)")
+
+
+def is_noop(reply: str) -> bool:
+    """A reply that says nothing: not worth a Telegram message."""
+    r = reply.strip().strip("*_`.").lower()
+    return not r or any(r == n.strip(".") or r == n.strip("()") for n in NOOP)
 
 
 FEED = {   # record event -> one line for the operator: only work that is done
@@ -458,7 +597,9 @@ def push_feed(st: dict) -> None:
 def chat_worker() -> None:
     """Chat with the chief of staff, one message at a time, off the main loop."""
     while True:
-        cmd, text = CHAT.get()
+        cmd, text, human = CHAT.get()
+        if human:   # when cos starts on an operator message: the window for follow-ups (check_followups)
+            HUMAN_TURN.write_text(str(time.time()))
         try:
             safe("sendChatAction", chat_id=ALLOW["chat_id"], action="typing")
             r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
@@ -468,6 +609,10 @@ def chat_worker() -> None:
         except Exception as e:
             reply = f"(chat failed: {e})"
         log(f"chat: {len(text)} chars in, {len(reply)} out")
+        if is_noop(reply):
+            log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
+            CHAT.task_done()
+            continue
         for i in range(0, len(reply), 3900):
             safe("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
         CHAT.task_done()
@@ -501,6 +646,7 @@ def main() -> None:
                     push_feed(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
+                    check_followups(a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every
             for u in tg("getUpdates", offset=st["offset"], timeout=a.poll, allowed_updates=["message", "callback_query"]):
                 st["offset"] = u["update_id"] + 1

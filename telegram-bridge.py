@@ -166,10 +166,37 @@ def budget_kb(item: dict) -> list:
 
 HEAD = {"goal_proposed": "🆕 Goal to approve", "goal_completed": "🏁 Goal completed: accept or reopen",
         "escalation_open": "⚠️ Escalation", "goal_abandoned_open_tasks": "🧹 Abandoned goal with open tasks",
-        "exception_pending": "⚖️ Exception request", "proposal_pending": "📝 Proposal to decide"}
+        "exception_pending": "⚖️ Exception request", "proposal_pending": "📝 Proposal to decide",
+        "task_blocked_unanswered_any": "❓ A worker's question has waited 30+ min (the chief of staff hasn't answered)"}
 
 
 REMIND_S = 12 * 3600
+# A worker's question goes to the chief of staff only; nothing told the operator when it sat (cust-1-coordinator
+# waited 16 h on 2026-10-13). Past QUESTION_WAIT_S it comes here too, every QUESTION_REMIND_S until answered.
+QUESTION_WAIT_S, QUESTION_REMIND_S = 30 * 60, 2 * 3600
+
+
+def waiting_questions(st: dict, now: float) -> list:
+    ok, out = hive("inbox", "--for", "chief_of_staff", "--json")
+    if not ok:
+        log(f"chief of staff inbox failed: {out}")
+        return []
+    items = [i for i in json.loads(out) if i["kind"] == "task_blocked_unanswered_any"]
+    seen = st.setdefault("question_seen", {})
+    for k in [k for k in seen if k not in {i["key"] for i in items}]:
+        del seen[k]                  # answered: forget it
+    for i in items:
+        seen.setdefault(i["key"], now)
+    return [i for i in items if now - seen[i["key"]] >= QUESTION_WAIT_S]
+
+
+def question_text(tid: str) -> str:
+    ok, out = hive("task", tid)
+    if not ok:
+        return ""
+    t = json.loads(out)
+    b = t.get("task", t).get("block") or {}
+    return f"\n\n<i>Needs {esc(b.get('needs', '?'))}:</i> {esc(b['reason'])}" if b.get("reason") else ""
 
 
 def push_inbox(st: dict) -> None:
@@ -179,13 +206,16 @@ def push_inbox(st: dict) -> None:
         return
     sent_at = st.setdefault("notified_at", {})
     now = time.time()
-    for item in json.loads(out):
+    for item in json.loads(out) + waiting_questions(st, now):
+        question = item["kind"] == "task_blocked_unanswered_any"
         # Sent before (and recently): skip. Sent long ago, or before sent_at existed: remind.
-        if item["key"] in st["notified"] and now - sent_at.get(item["key"], 0) < REMIND_S:
+        if item["key"] in st["notified"] and now - sent_at.get(item["key"], 0) < (QUESTION_REMIND_S if question else REMIND_S):
             continue
         reminder = item["key"] in st["notified"]
         text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
         text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
+        if question:
+            text += question_text(item["id"])
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
         kb = buttons(item) or budget_kb(item)
         tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML",

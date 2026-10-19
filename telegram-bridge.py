@@ -69,13 +69,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-CFG = Path.home() / ".config" / "hive"
-STATE = Path.home() / "work" / "1hive" / ".telegram" / "state.json"
+import hive_paths as hp
+
+CFG = hp.CONFIG_DIR
+STATE = hp.WORK_DIR / ".telegram" / "state.json"
 TOKEN = (CFG / "telegram-token").read_text().strip()
 ALLOW = json.loads((CFG / "telegram.json").read_text())
-ENV = {**os.environ, "HIVE_URL": "http://127.0.0.1:8470", "HIVE_ID": "1-hive",
-       "HIVE_KEY_FILE": str(CFG / "telegram-bridge.key"), "HIVE_VIA": "telegram",
-       "PATH": f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}"}
+ENV = hp.tool_env(CFG / "telegram-bridge.key", "telegram")
 
 
 def log(msg: str) -> None:
@@ -240,13 +240,13 @@ def next_digest(after: float) -> dt.datetime:
 
 def sweeps_since(t: float) -> tuple[int, int] | None:
     """Task folders the sweeper removed since time t (tools/sweeper.py): (count, bytes)."""
-    f = Path.home() / "work" / "1hive" / ".sweeper" / "log.jsonl"
+    f = hp.WORK_DIR / ".sweeper" / "log.jsonl"
     rows = [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
     rows = [r for r in rows if dt.datetime.fromisoformat(r["at"].replace("Z", "+00:00")).timestamp() > t]
     return (len(rows), sum(r["bytes"] for r in rows)) if rows else None
 
 
-WORKSPACE = Path("/home/omegahive/repos/hive-workspace.git")
+WORKSPACE = hp.WORKSPACE_REPO
 SLOW_REVIEW_S = 3600
 
 
@@ -302,7 +302,7 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     tasks_by_goal: dict = {}
     for t in state.get("tasks", {}).values():
         tasks_by_goal.setdefault(t.get("goal"), []).append(t)
-    lines = [f"📊 <b>1-hive digest</b> · {dt.datetime.now().astimezone():%a %d %b %H:%M}",
+    lines = [f"📊 <b>{hp.HIVE_ID} digest</b> · {dt.datetime.now().astimezone():%a %d %b %H:%M}",
              f"{len(events)} events since the last digest (now at position {head})."]
     shown = 0
     for g in sorted(state.get("goals", {}).values(), key=lambda g: g.get("proposed_at") or ""):
@@ -449,7 +449,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         return
     if text in ("/start", "/help"):
         tg("sendMessage", chat_id=ALLOW["chat_id"],
-           text="1-hive: I'll message you when a goal needs approval or acceptance, or something escalates, "
+           text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
                 "/digest sends the digest now; /board shows what each agent is doing.")
         return
@@ -488,7 +488,7 @@ def board_text() -> str:
         with urllib.request.urlopen(f"{FLOOR}/api/live", timeout=10) as r:
             live = json.load(r)["live"]
     except Exception as e:
-        return f"The Floor isn't answering ({esc(str(e))[:120]}). Check: systemctl --user status 1-hive-floor"
+        return f"The Floor isn't answering ({esc(str(e))[:120]}). Check: systemctl --user status {hp.HIVE_ID}-floor"
     lines = []
     for g in st["goals"].values():
         if g["status"] not in ("proposed", "active", "completed"):
@@ -559,7 +559,7 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
-FOLLOWUPS = Path.home() / "work" / "1hive" / "cos" / "followups"
+FOLLOWUPS = hp.WORK_DIR / "cos" / "followups"
 FOLLOWUP_WINDOW_S, FOLLOWUP_AHEAD_S, FOLLOWUP_MAX = 16 * 60, 2 * 3600, 3
 
 
@@ -625,7 +625,7 @@ def last_human_turn() -> float:
         return 0.0
 
 
-COS_WORKSPACE = Path.home() / "work" / "1hive" / "cos" / "workspace"
+COS_WORKSPACE = hp.WORK_DIR / "cos" / "workspace"
 ATTACH_MAX, ATTACH_BYTES = 5, 10 * 1024 * 1024
 PHOTO_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
 FILE_TYPES = PHOTO_TYPES | {".gif", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html"}

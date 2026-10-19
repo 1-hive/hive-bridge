@@ -16,7 +16,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-CFG = Path.home() / ".config" / "hive"
+import hive_paths as hp
+
+CFG = hp.CONFIG_DIR
 
 
 def main() -> None:

@@ -36,13 +36,15 @@ from urllib.parse import parse_qs, urlparse
 from hiverecord.client import Client, HiveError
 from hiverecord.keys import SigningKey
 
+import hive_paths as hp
+
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "floor" / "index.html"
-WORK = Path.home() / "work" / "1hive"
+WORK = hp.WORK_DIR
 ROUTE = WORK / ".route"
-CFG = Path(os.environ.get("HIVE_CONFIG_DIR", Path.home() / ".config" / "hive"))
+CFG = hp.CONFIG_DIR
 
-client = Client(os.environ.get("HIVE_URL", "http://127.0.0.1:8470"), os.environ.get("HIVE_ID", "1-hive"),
+client = Client(hp.HIVE_URL, hp.HIVE_ID,
                 SigningKey.from_file(os.environ.get("FLOOR_KEY_FILE", str(CFG / "floor.key"))))
 
 NOTE_KEYS = ("kind", "verdict", "code", "to", "reviewer", "reason", "resolution", "outcome", "note", "title")
@@ -269,7 +271,7 @@ def main() -> None:
     ap.add_argument("--bind", default="127.0.0.1")
     a = ap.parse_args()
     client.health()
-    print(f"1-hive Floor on http://{a.bind}:{a.port}", flush=True)
+    print(f"{hp.HIVE_ID} Floor on http://{a.bind}:{a.port}", flush=True)
     ThreadingHTTPServer((a.bind, a.port), Handler).serve_forever()
 
 

@@ -1,6 +1,6 @@
 # hive-bridge: design
 
-Status: agreed direction, 2026-10-19. Not built yet: the code here is still 1-hive's single-chat bridge.
+Status: agreed 2026-10-19; built in v0.2.0 (see the README's "Group chats"). Not yet built: a task's origin message on the record (the open question below). Until then, the chief of staff routes results with `[[to: <chat>]]`.
 
 `hive-bridge` is where humans meet a hive: a chat bridge (Telegram first) and the read-only Floor. It's the human/agent half of the release plan's R7, shared by every hive. A hive brings only configuration. Today's `tools/telegram-bridge.py` is its starting point; it handles one private chat with one human.
 

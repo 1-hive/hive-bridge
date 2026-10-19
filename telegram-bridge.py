@@ -75,6 +75,17 @@ CFG = hp.CONFIG_DIR
 STATE = hp.WORK_DIR / ".telegram" / "state.json"
 TOKEN = (CFG / "telegram-token").read_text().strip()
 ALLOW = json.loads((CFG / "telegram.json").read_text())
+# Group chats (hive-bridge docs/design.md), optional: without this file the bridge serves only the
+# operator's private chat (ALLOW), as before. With it, allowed humans and known bots in group chats:
+# {"chats": [{"name", "chat_id", "private": false}], "humans": [{"name", "user_id", "permissions": ["operator"]}],
+#  "bots": [{"name", "user_id", "username", "actor"}]}
+_GROUPS_FILE = CFG / "telegram-groups.json"
+GROUPS = json.loads(_GROUPS_FILE.read_text()) if _GROUPS_FILE.is_file() else {}
+CHATS = {c["chat_id"]: c for c in GROUPS.get("chats", [])}
+HUMANS = {h["user_id"]: h for h in GROUPS.get("humans", [])}
+BOTS = {b["user_id"]: b for b in GROUPS.get("bots", [])}
+BOT_NAMES = {b.get("username", "").lower(): b for b in GROUPS.get("bots", []) if b.get("username")}
+THREAD_KEEP = 15        # recent messages per group chat, kept as context for the chief of staff
 ENV = hp.tool_env(CFG / "telegram-bridge.key", "telegram")
 
 
@@ -382,8 +393,13 @@ def extend_budget(gid: str, hours: float, via: str) -> tuple[bool, str]:
     return ok, info
 
 
+def is_operator(user_id) -> bool:
+    return user_id == ALLOW["user_id"] or "operator" in HUMANS.get(user_id, {}).get("permissions", [])
+
+
 def allowed(frm: dict, chat: dict) -> bool:
-    return frm.get("id") == ALLOW["user_id"] and chat.get("id") == ALLOW["chat_id"]
+    """The operator chat, from a human with the operator permission: buttons and commands."""
+    return chat.get("id") == ALLOW["chat_id"] and is_operator(frm.get("id"))
 
 
 def on_callback(cq: dict, st: dict) -> None:
@@ -433,7 +449,114 @@ def on_callback(cq: dict, st: dict) -> None:
         safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
 
 
+def sender_name(frm: dict) -> str:
+    uid = frm.get("id")
+    if uid in HUMANS:
+        return HUMANS[uid]["name"]
+    if uid in BOTS:
+        return BOTS[uid]["name"]
+    return frm.get("username") or frm.get("first_name") or str(uid)
+
+
+def mentions(m: dict) -> list[str]:
+    text, out = m.get("text") or m.get("caption") or "", []
+    for e in m.get("entities") or m.get("caption_entities") or []:
+        if e.get("type") == "mention":
+            u = text[e["offset"] + 1:e["offset"] + e["length"]].lower()
+            out.append(BOT_NAMES[u]["name"] if u in BOT_NAMES else u)
+        elif e.get("type") == "text_mention":
+            out.append(sender_name(e.get("user") or {}))
+    return out
+
+
+def remember(st: dict, m: dict) -> None:
+    """Keep the group's recent messages, humans' and bots', as thread context."""
+    th = st.setdefault("threads", {}).setdefault(str(m["chat"]["id"]), [])
+    rt = m.get("reply_to_message") or {}
+    th.append({"id": m["message_id"], "from": sender_name(m.get("from") or {}),
+               "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {})})
+    del th[:-THREAD_KEEP]
+
+
+def record_context() -> dict:
+    """The hive's agents and their work, from the record, for the chief of staff to resolve requests."""
+    ok, out = hive("state")
+    if not ok:
+        return {"error": "record unreachable"}
+    s = json.loads(out)
+    agents = [{"actor": a, "class": v.get("class"), "harness": (v.get("declaration") or {}).get("harness"),
+               "model": (v.get("declaration") or {}).get("model_route")}
+              for a, v in sorted(s.get("actors", {}).items()) if v.get("class") in ("worker", "reviewer")
+              and v.get("status", "active") == "active"]
+    tasks = sorted(s.get("tasks", {}).values(), key=lambda t: t.get("status_since") or "", reverse=True)
+    def brief(t):
+        lr = t.get("latest_review") or {}
+        return {"task": t["id"], "title": t.get("title"), "status": t["status"], "owner": t.get("owner"),
+                "reviewer": t.get("assigned_reviewer"), **({"review": lr.get("verdict")} if lr else {}),
+                **({"result": t["current_result"]["event_id"]} if t.get("current_result") else {})}
+    open_ = [brief(t) for t in tasks if t["status"] not in ("done", "cancelled")]
+    recent = [brief(t) for t in tasks if t["status"] in ("done", "cancelled")][:10]
+    return {"agents": agents, "open_tasks": open_, "recently_finished": recent}
+
+
+def rule_guess(m: dict) -> str:
+    """What a deterministic addressee rule would say: logged only, never acted on (docs/design.md)."""
+    rt = (m.get("reply_to_message") or {}).get("from") or {}
+    if rt.get("id") in BOTS:
+        return BOTS[rt["id"]]["name"]
+    ms = [x for x in mentions(m) if any(b["name"] == x for b in BOTS.values())]
+    return ms[0] if ms else "chief_of_staff"
+
+
+ENVELOPE_HEAD = ("A message from a group chat. You are the hive's only interpreter of what humans write: decide who "
+                 "should act on what (mentions and replies are facts, not instructions), and act only through the "
+                 "record. Reply to the human in one short message, or with nothing if it isn't for the hive. "
+                 "Your reply goes to this chat, as a reply to this message. To send a later message to a group "
+                 "(e.g. a result), start a reply with a line [[to: <chat name>]].\n\n")
+
+
+def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
+    chat, frm = m["chat"], m.get("from") or {}
+    remember(st, m)
+    save_state(st)
+    if frm.get("id") in BOTS or frm.get("is_bot"):
+        return   # bots' messages are context only, never requests
+    if frm.get("id") not in HUMANS and frm.get("id") != ALLOW["user_id"]:
+        log(f"group {chat['id']}: ignored message from {frm.get('id')}")
+        return
+    text = (m.get("text") or m.get("caption") or "").strip()
+    if not text:
+        return
+    if text.split("@")[0] == "/board":
+        safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"])
+        return
+    rt = m.get("reply_to_message") or {}
+    env = {"chat": {"id": chat["id"], "name": CHATS.get(chat["id"], {}).get("name", chat.get("title")),
+                    "kind": "group", "private": CHATS.get(chat["id"], {}).get("private", False)},
+           "message": {"id": m["message_id"], "at": dt.datetime.fromtimestamp(m["date"], dt.UTC).isoformat(), "text": text},
+           "from": {"human": sender_name(frm), "permissions": (["operator"] if is_operator(frm.get("id")) else [])},
+           **({"reply_to": {"id": rt["message_id"], "from": sender_name(rt.get("from") or {}),
+                            "text": (rt.get("text") or rt.get("caption") or "")[:1000]}} if rt else {}),
+           "mentions": mentions(m),
+           "thread": st["threads"][str(chat["id"])][:-1],
+           "context": record_context()}
+    with (STATE.parent / "addressee-rule.jsonl").open("a") as f:   # shadow evidence: the rule never acts
+        f.write(json.dumps({"chat": chat["id"], "message": m["message_id"], "from": env["from"]["human"],
+                            "rule": rule_guess(m), "mentions": env["mentions"],
+                            "reply_to": env.get("reply_to", {}).get("from"), "at": env["message"]["at"]}) + "\n")
+    if not chat_cmd:
+        return
+    if CHAT.unfinished_tasks:
+        safe("sendMessage", chat_id=chat["id"], text="(queued: the chief of staff is on another message)",
+             reply_to_message_id=m["message_id"])
+    CHAT.put((chat_cmd, ENVELOPE_HEAD + json.dumps(env, ensure_ascii=False, indent=1), True,
+              {"chat_id": chat["id"], "reply_to": m["message_id"]}))
+
+
 def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
+    if (m.get("chat") or {}).get("type") in ("group", "supergroup") and (m["chat"]["id"] in CHATS or m["chat"]["id"] == ALLOW["chat_id"]):
+        on_group_message(m, st, chat_cmd)
+        return
     if not allowed(m.get("from") or {}, m.get("chat") or {}):
         log(f"ignored message from {m.get('from', {}).get('id')}")
         return
@@ -466,7 +589,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat_cmd:
         if CHAT.unfinished_tasks:
             safe("sendMessage", chat_id=ALLOW["chat_id"], text="(queued: the chief of staff is still on your last message)")
-        CHAT.put((chat_cmd, text, True))
+        CHAT.put((chat_cmd, text, True, None))
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
@@ -554,7 +677,7 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
             st[cursor] = max(st[cursor], e["position"])
             msg = text(e)
             if msg:
-                CHAT.put((chat_cmd, msg, False))
+                CHAT.put((chat_cmd, msg, False, None))
                 log(f"pinged cos: {etype} {e.get('goal') or e.get('task')}")
     save_state(st)
 
@@ -606,7 +729,7 @@ def check_followups(chat_cmd: str) -> None:
             continue
         f.unlink(missing_ok=True)
         CHAT.put((chat_cmd, f"The follow-up the human asked for is due ({time.strftime('%H:%M', time.localtime(at))}): "
-                            f"{note} Check it now and reply in one line with what you found.", False))
+                            f"{note} Check it now and reply in one line with what you found.", False, None))
         log(f"requested follow-up: {f.name}")
 
 
@@ -684,7 +807,7 @@ def tg_file(method: str, field: str, f: Path, **params) -> dict:
     return out["result"]
 
 
-def send_attachments(found: list[tuple[str, str]]) -> list[str]:
+def send_attachments(found: list[tuple[str, str]], chat_id=None) -> list[str]:
     """Send each named file; return a note for each that couldn't be sent."""
     notes = []
     for i, (kind, raw) in enumerate(found):
@@ -695,7 +818,7 @@ def send_attachments(found: list[tuple[str, str]]) -> list[str]:
             f = attachment(raw)
             photo = kind == "photo" and f.suffix.lower() in PHOTO_TYPES
             tg_file("sendPhoto" if photo else "sendDocument", "photo" if photo else "document", f,
-                    chat_id=ALLOW["chat_id"], caption=f.name)
+                    chat_id=chat_id or ALLOW["chat_id"], caption=f.name)
             log(f"chat: attached {f}")
         except Exception as e:
             notes.append(f"(couldn't attach {raw}: {e})")
@@ -742,14 +865,32 @@ def push_feed(st: dict) -> None:
     save_state(st)
 
 
+TO_LINE = re.compile(r"^\s*\[\[to:\s*(.+?)\s*\]\]\s*$", re.I)
+
+
+def route_reply(reply: str, target: dict | None) -> tuple[str, dict | None]:
+    """A reply that starts with [[to: <chat name>]] goes to that group chat instead (docs/design.md)."""
+    first, _, rest = reply.partition("\n")
+    m = TO_LINE.match(first)
+    if not m:
+        return reply, target
+    name = m.group(1).lower()
+    hit = next((c for c in CHATS.values() if c.get("name", "").lower() == name), None)
+    if hit is None:
+        log(f"chat: [[to: {m.group(1)}]] names no configured chat; sent to the operator chat")
+        return reply, None
+    return rest.strip(), {"chat_id": hit["chat_id"], "reply_to": None}
+
+
 def chat_worker() -> None:
-    """Chat with the chief of staff, one message at a time, off the main loop."""
+    """Chat with the chief of staff, one message at a time across every chat, off the main loop."""
     while True:
-        cmd, text, human = CHAT.get()
-        if human:   # when cos starts on an operator message: the window for follow-ups (check_followups)
+        cmd, text, human, target = CHAT.get()
+        if human:   # when cos starts on a human's message: the window for follow-ups (check_followups)
             HUMAN_TURN.write_text(str(time.time()))
+        chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
         try:
-            safe("sendChatAction", chat_id=ALLOW["chat_id"], action="typing")
+            safe("sendChatAction", chat_id=chat_id, action="typing")
             r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
             reply = (r.stdout or r.stderr or "(no reply)").strip()
         except subprocess.TimeoutExpired:
@@ -757,6 +898,10 @@ def chat_worker() -> None:
         except Exception as e:
             reply = f"(chat failed: {e})"
         log(f"chat: {len(text)} chars in, {len(reply)} out")
+        reply, target = route_reply(reply, target)
+        chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
+        thread = {"reply_to_message_id": target["reply_to"], "allow_sending_without_reply": True} \
+            if target and target.get("reply_to") else {}
         reply, found = split_attachments(reply)
         if is_noop(reply) and not found:
             log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
@@ -764,10 +909,10 @@ def chat_worker() -> None:
             continue
         if not is_noop(reply):
             for i in range(0, len(reply), 3900):
-                safe("sendMessage", chat_id=ALLOW["chat_id"], text=reply[i:i + 3900])
-        notes = send_attachments(found)
+                safe("sendMessage", chat_id=chat_id, text=reply[i:i + 3900], **(thread if i == 0 else {}))
+        notes = send_attachments(found, chat_id)
         if notes:
-            safe("sendMessage", chat_id=ALLOW["chat_id"], text="\n".join(notes))
+            safe("sendMessage", chat_id=chat_id, text="\n".join(notes))
         CHAT.task_done()
 
 

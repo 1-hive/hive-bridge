@@ -18,7 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 OP_CHAT, OP_USER, ANDY, BEN, STRANGER = 111, 1001, 1002, 1003, 1999
-GROUP, BOT1, BOT3 = -500, 2001, 2003
+GROUP, BOT1, BOT3, PHILO, COSBOT = -500, 2001, 2003, -600, 3000
 
 
 def load(groups: bool):
@@ -27,7 +27,8 @@ def load(groups: bool):
     (cfg / "telegram.json").write_text(json.dumps({"chat_id": OP_CHAT, "user_id": OP_USER}))
     if groups:
         (cfg / "telegram-groups.json").write_text(json.dumps({
-            "chats": [{"name": "main", "chat_id": GROUP, "private": False}],
+            "chats": [{"name": "main", "chat_id": GROUP, "private": False},
+                      {"name": "philosophy", "chat_id": PHILO, "mode": "mention"}],
             "humans": [{"name": "andy", "user_id": ANDY, "permissions": ["operator"]},
                        {"name": "ben", "user_id": BEN, "permissions": ["operator"]}],
             "bots": [{"name": "bot1", "user_id": BOT1, "username": "Bot1Bot", "actor": "worker.bot1"},
@@ -174,7 +175,30 @@ def main():
     run_worker_once(b)
     check("a record-driven reply's [[task: ]] line records no origin", "t10" not in b.load_origins(), b.load_origins())
 
-    # 5. buttons: any human with the operator permission, in the operator chat only
+    # 5. a conversation group in mention mode: context and the dialogue log only, unless the chief of staff is asked
+    b.ME.update({"id": COSBOT, "username": "CosBot"})
+    b.on_message(msg(PHILO, "group", BEN, "Is a hive conscious?", 20), st, "COS")
+    b.on_message(msg(PHILO, "group", BOT1, "Only if it dreams.", 21, is_bot=True), st, "COS")
+    check("mention mode: plain talk doesn't wake the chief of staff", b.CHAT.empty())
+    t3 = "@CosBot make this a task for @Bot3Bot"
+    b.on_message(msg(PHILO, "group", BEN, t3, 22, entities=[mention(t3, "CosBot"), mention(t3, "Bot3Bot")]), st, "COS")
+    _, text, _, target = b.CHAT.get(timeout=5); b.CHAT.task_done()
+    env = json.loads(text[len(b.ENVELOPE_HEAD):])
+    check("mention mode: @cos wakes it, with the thread", env["from"]["human"] == "ben" and env["chat"]["name"] == "philosophy"
+          and any("dreams" in x["text"] for x in env["thread"]) and target["reply_to"] == 22, env)
+    t4 = "@CosBot please assign me a review of t7"
+    b.on_message(msg(PHILO, "group", BOT1, t4, 23, is_bot=True, entities=[mention(t4, "CosBot")]), st, "COS")
+    _, text, _, _ = b.CHAT.get(timeout=5); b.CHAT.task_done()
+    env = json.loads(text[len(b.ENVELOPE_HEAD):])
+    check("mention mode: a known bot may ask the chief of staff", env["from"] == {"bot": "bot1", "actor": "worker.bot1"}, env["from"])
+    b.on_message(msg(PHILO, "group", BEN, "thanks", 24, reply_to={"message_id": 9, "from": {"id": COSBOT, "is_bot": True}}), st, "COS")
+    check("mention mode: a reply to the chief of staff's message wakes it", not b.CHAT.empty())
+    b.CHAT.get(timeout=5); b.CHAT.task_done()
+    rows = [json.loads(l) for l in (work / ".telegram" / "dialogue.jsonl").read_text().splitlines()]
+    check("dialogue log: every message in every chat, humans and bots", [r["id"] for r in rows if r["chat"] == PHILO] == [20, 21, 22, 23, 24]
+          and any(r["bot"] for r in rows) and all(r["chat_name"] for r in rows), rows[-3:])
+
+    # 6. buttons: any human with the operator permission, in the operator chat only
     check("andy (operator) may press buttons in the operator chat", b.allowed({"id": ANDY}, {"id": OP_CHAT}))
     check("nobody presses buttons in the group", not b.allowed({"id": ANDY}, {"id": GROUP}))
     check("a stranger may not", not b.allowed({"id": STRANGER}, {"id": OP_CHAT}))

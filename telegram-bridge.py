@@ -77,8 +77,11 @@ TOKEN = (CFG / "telegram-token").read_text().strip()
 ALLOW = json.loads((CFG / "telegram.json").read_text())
 # Group chats (hive-bridge docs/design.md), optional: without this file the bridge serves only the
 # operator's private chat (ALLOW), as before. With it, allowed humans and known bots in group chats:
-# {"chats": [{"name", "chat_id", "private": false}], "humans": [{"name", "user_id", "permissions": ["operator"]}],
-#  "bots": [{"name", "user_id", "username", "actor"}]}
+# {"chats": [{"name", "chat_id", "private": false, "mode": "all" | "mention"}],
+#  "humans": [{"name", "user_id", "permissions": ["operator"]}], "bots": [{"name", "user_id", "username", "actor"}]}
+# mode "all" (the work group): every human message goes to the chief of staff. mode "mention" (a conversation
+# group): only messages that @-mention the bridge's bot or reply to it, from humans and from known bots.
+# Every message seen, in every listed chat, goes to the dialogue log (.telegram/dialogue.jsonl).
 _GROUPS_FILE = CFG / "telegram-groups.json"
 GROUPS = json.loads(_GROUPS_FILE.read_text()) if _GROUPS_FILE.is_file() else {}
 CHATS = {c["chat_id"]: c for c in GROUPS.get("chats", [])}
@@ -86,6 +89,8 @@ HUMANS = {h["user_id"]: h for h in GROUPS.get("humans", [])}
 BOTS = {b["user_id"]: b for b in GROUPS.get("bots", [])}
 BOT_NAMES = {b.get("username", "").lower(): b for b in GROUPS.get("bots", []) if b.get("username")}
 THREAD_KEEP = 15        # recent messages per group chat, kept as context for the chief of staff
+ME: dict = {}           # the bridge's own bot (getMe), for mention mode
+DIALOGUE = STATE.parent / "dialogue.jsonl"   # every message the bridge sees, for the record later (R7)
 ENV = hp.tool_env(CFG / "telegram-bridge.key", "telegram")
 
 
@@ -470,12 +475,34 @@ def mentions(m: dict) -> list[str]:
 
 
 def remember(st: dict, m: dict) -> None:
-    """Keep the group's recent messages, humans' and bots', as thread context."""
+    """Keep the group's recent messages, humans' and bots', as thread context, and log every one."""
     th = st.setdefault("threads", {}).setdefault(str(m["chat"]["id"]), [])
     rt = m.get("reply_to_message") or {}
-    th.append({"id": m["message_id"], "from": sender_name(m.get("from") or {}),
-               "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {})})
+    entry = {"id": m["message_id"], "from": sender_name(m.get("from") or {}),
+             "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {})}
+    th.append(entry)
     del th[:-THREAD_KEEP]
+    try:
+        with DIALOGUE.open("a") as f:
+            f.write(json.dumps({"chat": m["chat"]["id"], "chat_name": CHATS.get(m["chat"]["id"], {}).get("name"),
+                                "at": dt.datetime.fromtimestamp(m.get("date", 0), dt.UTC).isoformat(),
+                                "from_id": (m.get("from") or {}).get("id"), "bot": bool((m.get("from") or {}).get("is_bot")),
+                                **entry, "text": (m.get("text") or m.get("caption") or "")}) + "\n")
+    except OSError as e:
+        log(f"dialogue log: {e}")
+
+
+def addressed_to_me(m: dict) -> bool:
+    """Mentions the bridge's bot, or replies to one of its messages."""
+    me = ME.get("username", "").lower()
+    rt = (m.get("reply_to_message") or {}).get("from") or {}
+    if ME and rt.get("id") == ME.get("id"):
+        return True
+    text = m.get("text") or m.get("caption") or ""
+    for e in m.get("entities") or m.get("caption_entities") or []:
+        if e.get("type") == "mention" and text[e["offset"] + 1:e["offset"] + e["length"]].lower() == me:
+            return True
+    return False
 
 
 def record_context() -> dict:
@@ -521,9 +548,13 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     chat, frm = m["chat"], m.get("from") or {}
     remember(st, m)
     save_state(st)
-    if frm.get("id") in BOTS or frm.get("is_bot"):
-        return   # bots' messages are context only, never requests
-    if frm.get("id") not in HUMANS and frm.get("id") != ALLOW["user_id"]:
+    mention_mode = CHATS.get(chat["id"], {}).get("mode", "all") == "mention"
+    is_bot = frm.get("id") in BOTS or frm.get("is_bot")
+    if mention_mode and not addressed_to_me(m):
+        return   # a conversation group: context only, unless the chief of staff is asked
+    if is_bot and not (mention_mode and frm.get("id") in BOTS):
+        return   # bots' messages are context only, except a known bot asking the chief of staff for work
+    if not is_bot and frm.get("id") not in HUMANS and frm.get("id") != ALLOW["user_id"]:
         log(f"group {chat['id']}: ignored message from {frm.get('id')}")
         return
     text = (m.get("text") or m.get("caption") or "").strip()
@@ -536,14 +567,15 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     env = {"chat": {"id": chat["id"], "name": CHATS.get(chat["id"], {}).get("name", chat.get("title")),
                     "kind": "group", "private": CHATS.get(chat["id"], {}).get("private", False)},
            "message": {"id": m["message_id"], "at": dt.datetime.fromtimestamp(m["date"], dt.UTC).isoformat(), "text": text},
-           "from": {"human": sender_name(frm), "permissions": (["operator"] if is_operator(frm.get("id")) else [])},
+           "from": ({"bot": sender_name(frm), "actor": BOTS.get(frm.get("id"), {}).get("actor")} if is_bot
+                    else {"human": sender_name(frm), "permissions": (["operator"] if is_operator(frm.get("id")) else [])}),
            **({"reply_to": {"id": rt["message_id"], "from": sender_name(rt.get("from") or {}),
                             "text": (rt.get("text") or rt.get("caption") or "")[:1000]}} if rt else {}),
            "mentions": mentions(m),
            "thread": st["threads"][str(chat["id"])][:-1],
            "context": record_context()}
     with (STATE.parent / "addressee-rule.jsonl").open("a") as f:   # shadow evidence: the rule never acts
-        f.write(json.dumps({"chat": chat["id"], "message": m["message_id"], "from": env["from"]["human"],
+        f.write(json.dumps({"chat": chat["id"], "message": m["message_id"], "from": env["from"].get("human") or env["from"].get("bot"),
                             "rule": rule_guess(m), "mentions": env["mentions"],
                             "reply_to": env.get("reply_to", {}).get("from"), "at": env["message"]["at"]}) + "\n")
     if not chat_cmd:
@@ -997,6 +1029,12 @@ def main() -> None:
     REMIND_S = a.remind_hours * 3600
     DIGEST_AT = tuple(int(x) for x in a.digest_at.split(":"))
     st = load_state()
+    if CHATS:
+        try:
+            ME.update(tg("getMe"))
+            log(f"bridge bot: @{ME.get('username')}")
+        except Exception as e:
+            log(f"getMe failed: {e}")
     threading.Thread(target=chat_worker, daemon=True).start()
     log("bridge up")
     next_inbox = 0.0

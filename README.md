@@ -22,14 +22,16 @@ Optional `HIVE_CONFIG_DIR/telegram-groups.json`. Without it, nothing changes for
 
 ```json
 {
-  "chats":  [{"name": "main", "chat_id": -1001234567890, "private": false}],
+  "chats":  [{"name": "work", "chat_id": -1001234567890, "mode": "all"},
+             {"name": "protobots", "chat_id": -5437945421, "mode": "mention"}],
   "humans": [{"name": "ben", "user_id": 111, "permissions": ["operator"]},
              {"name": "andy", "user_id": 222, "permissions": ["operator"]}],
   "bots":   [{"name": "protomega2", "user_id": 333, "username": "Protomega2bot", "actor": "worker.protomegabot2"}]
 }
 ```
 
-- **Every allowed human's message** in a listed group goes to the chief of staff, the hive's only interpreter. The message is sent as an envelope of facts: who wrote it, what it replies to and who wrote that, its mentions, the recent thread, and the hive's agents and tasks from the record. The chief of staff's reply is threaded on the message.
+- **Two modes per chat.** In a `mode: all` chat (the work group) every allowed human's message goes to the chief of staff, the hive's only interpreter of what humans write. In a `mode: mention` chat (a conversation group) only messages that @-mention the bridge's bot or reply to it do, from humans and from the listed bots (a bot may ask the chief of staff for work); everything else there is context only.
+- **A dialogue log.** Every message the bridge sees in a listed chat, humans' and bots', goes to `HIVE_WORK_DIR/.telegram/dialogue.jsonl` (chat, sender, text, reply), outside the task record, for search and for the record's message events later (R7). The message is sent as an envelope of facts: who wrote it, what it replies to and who wrote that, its mentions, the recent thread, and the hive's agents and tasks from the record. The chief of staff's reply is threaded on the message.
 - **Bots' messages are thread context only,** never requests. Unknown senders and unlisted groups are ignored. `/board` works in a group.
 - **One chief of staff, one queue across every chat.** A reply whose first line is `[[to: <chat name>]]` goes to that group, for example a result announced after a review passes.
 - **A task started from a message is threaded there.** When the chief of staff creates one, its reply carries `[[task: <id>]]`. The bridge then posts the task's progress (started, a question, result posted, review verdicts, done) as replies to that message.

@@ -1,6 +1,6 @@
 # hive-bridge: design
 
-Status: agreed 2026-10-19; built in v0.2.0 (see the README's "Group chats"). Not yet built: a task's origin message on the record (the open question below). Until then, the chief of staff routes results with `[[to: <chat>]]`.
+Status: agreed 2026-10-19; built in v0.2.0 (see the README's "Group chats"). Since v0.3.0, a task started from a chat message is threaded there (below, "Results back into the chat").
 
 `hive-bridge` is where humans meet a hive: a chat bridge (Telegram first) and the read-only Floor. It's the human/agent half of the release plan's R7, shared by every hive. A hive brings only configuration. Today's `tools/telegram-bridge.py` is its starting point; it handles one private chat with one human.
 
@@ -67,7 +67,9 @@ It acts **only through the record**, then replies in the thread:
 
 ## Results back into the chat
 
-When a task started from a chat message posts its result or closes, the bridge posts a short line in the thread, as a reply to the origin message. A worker that has its own chat identity may post its full answer itself, as a reply to the same origin message, which the task carries. Either way, the worker gets the origin message only through the task, never by reading the chat.
+When the chief of staff creates a task for a chat message, its reply carries a line `[[task: <task id>]]`, which the bridge takes out of the visible reply. The bridge remembers which message the task came from, and posts the task's progress there as replies: started, a question, result posted, each review's verdict, done or cancelled. Then it forgets the origin.
+
+The origin stays in the bridge (`HIVE_WORK_DIR/.telegram/origins.json`), not on the record. It's chat bookkeeping, and the core profile allows no `ext` fields on a task. A worker with its own chat identity may still post its full answer itself.
 
 ## Shadow evidence for the roadmap
 
@@ -99,5 +101,4 @@ The chief of staff is any command that reads the envelope and prints a reply: Cl
 
 ## Open questions
 
-- **Where the task's origin goes on the record.** The core profile has no field for it yet: an `ext.origin` field in a profile, or an amendment.
 - **Slack:** the same envelope, a second transport.

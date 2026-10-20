@@ -148,7 +148,33 @@ def main():
     m = [p for meth, p in sent if meth == "sendMessage"][-1]
     check("other wakes still reply in the operator chat", m["chat_id"] == OP_CHAT, m)
 
-    # 4. buttons: any human with the operator permission, in the operator chat only
+    # 4. a task started from a group message: [[task: id]] in the reply, then its progress threaded there
+    sent.clear()
+    b.CHAT.put(("cat >/dev/null; printf 'Asked bot3 to improve it.\\n[[task: t9]]'", "x", True, {"chat_id": GROUP, "reply_to": 12}))
+    run_worker_once(b)
+    m = [p for meth, p in sent if meth == "sendMessage"][-1]
+    check("[[task: t9]] is taken out of the visible reply", m["text"] == "Asked bot3 to improve it." and m["reply_to_message_id"] == 12, m)
+    check("t9's origin is remembered", b.load_origins().get("t9") == {"chat_id": GROUP, "message_id": 12}, b.load_origins())
+    evs = [{"position": p, "type": t, "task": "t9", "actor": {"id": a}, "data": d} for p, t, a, d in [
+        (50, "task.accepted", "worker.bot3", {}), (51, "task.reported", "worker.bot3", {"kind": "progress"}),
+        (52, "task.result_posted", "worker.bot3", {}), (53, "review.recorded", "worker.bot1", {"verdict": "passed"}),
+        (54, "task.closed", "cos", {}), (55, "task.closed", "cos", {"task": "other"})]]
+    evs[-1]["task"] = "t1"
+    st["origin_pos"] = 49
+    b.hive = lambda *a: (True, "\n".join(json.dumps(e) for e in evs)) if a[0] == "events" else (True, "{}")
+    sent.clear()
+    b.push_origins(st)
+    lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    check("t9's progress is threaded on its origin message", lines == [
+        (GROUP, 12, "t9: started"), (GROUP, 12, "t9: result posted, waiting for review"),
+        (GROUP, 12, "t9: review passed (worker.bot1)"), (GROUP, 12, "t9: done ✅")], lines)
+    check("t9's origin is dropped once done", "t9" not in b.load_origins(), b.load_origins())
+    sent.clear()
+    b.CHAT.put(("cat >/dev/null; printf 'ok\\n[[task: t10]]'", "x", False, None))
+    run_worker_once(b)
+    check("a record-driven reply's [[task: ]] line records no origin", "t10" not in b.load_origins(), b.load_origins())
+
+    # 5. buttons: any human with the operator permission, in the operator chat only
     check("andy (operator) may press buttons in the operator chat", b.allowed({"id": ANDY}, {"id": OP_CHAT}))
     check("nobody presses buttons in the group", not b.allowed({"id": ANDY}, {"id": GROUP}))
     check("a stranger may not", not b.allowed({"id": STRANGER}, {"id": OP_CHAT}))

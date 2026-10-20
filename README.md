@@ -32,6 +32,7 @@ Optional `HIVE_CONFIG_DIR/telegram-groups.json`. Without it, nothing changes for
 - **Every allowed human's message** in a listed group goes to the chief of staff, the hive's only interpreter. The message is sent as an envelope of facts: who wrote it, what it replies to and who wrote that, its mentions, the recent thread, and the hive's agents and tasks from the record. The chief of staff's reply is threaded on the message.
 - **Bots' messages are thread context only,** never requests. Unknown senders and unlisted groups are ignored. `/board` works in a group.
 - **One chief of staff, one queue across every chat.** A reply whose first line is `[[to: <chat name>]]` goes to that group, for example a result announced after a review passes.
+- **A task started from a message is threaded there.** When the chief of staff creates one, its reply carries `[[task: <id>]]`. The bridge then posts the task's progress (started, a question, result posted, review verdicts, done) as replies to that message.
 - **Buttons** (approve, accept and the rest) stay in the operator chat (`telegram.json`), for any human with the `operator` permission.
 - **Shadow evidence:** `HIVE_WORK_DIR/.telegram/addressee-rule.jsonl` logs what a mention-or-reply rule would have picked for each message. The rule never acts.
 - **Telegram setup:** add the bot to the group, and turn its privacy mode off (BotFather: `/setprivacy` → Disable). Otherwise Telegram shows it only commands and replies to its own messages.

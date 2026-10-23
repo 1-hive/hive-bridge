@@ -264,11 +264,12 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
                 "detail": f"last turn {dur(f.now - last)} ago" if last else "", "active": False}
     if not b:
         said = last_said(f, actor)
+        sender = "runner" if cls == "reviewer" else "sidecar"
         if said:
             return {"state": "nodata", "headline": f"Last spoke in {said['where']} {dur(f.now - said['at'])} ago",
-                    "detail": "No activity data: its sidecar sends no beacons yet.", "active": False}
+                    "detail": f"No activity data: its {sender} sends no beacons yet.", "active": False}
         return {"state": "nodata", "headline": "No activity data",
-                "detail": "Its sidecar sends no beacons yet; on its plate is still the record's.", "active": False}
+                "detail": f"Its {sender} sends no beacons yet; what it owes below is still the record's.", "active": False}
     if age > OFFLINE_AFTER:
         return {"state": "offline", "headline": f"Offline for {dur(age)}", "since": b["received"],
                 "detail": f"No word from its {'runner' if cls == 'reviewer' else 'sidecar'} since "
@@ -539,9 +540,19 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
                     "text": f"needs {b.get('needs')} on {i['id']}; unanswered for {dur(f.now - since) if since else '?'}",
                     "who": "operators"})
     for b in roster:
-        if b["class"] == "reviewer" and b["now"]["state"] in ("cantrun", "offline") and b["plate"]:
-            out.append({"tone": "bad", "title": f"{b['name']} can't review", "text": f"{b['now'].get('detail') or b['now']['headline']}"
-                        f" · {len(b['plate'])} result{'s' if len(b['plate']) > 1 else ''} waiting", "who": "operators"})
+        if b["class"] != "reviewer" or not b["plate"] or b["now"]["state"] not in ("cantrun", "offline", "nodata"):
+            continue
+        waits = [f.now - ts((t.get("current_result") or {}).get("at")) for t in f.state.get("tasks", {}).values()
+                 if t.get("assigned_reviewer") == b["id"] and t["status"] == "in_review" and (t.get("current_result") or {}).get("at")]
+        oldest = max(waits, default=0)
+        n = f"{len(b['plate'])} result{'s' if len(b['plate']) > 1 else ''} waiting, the oldest {dur(oldest)}"
+        if b["now"]["state"] == "nodata":
+            if oldest > 3600:   # no beacons: maybe it isn't running at all
+                out.append({"tone": "bad", "title": f"{b['name']} hasn't reviewed for {dur(oldest)}",
+                            "text": f"{n}; its runner sends no beacons: is it running?", "who": "operators"})
+        else:
+            out.append({"tone": "bad", "title": f"{b['name']} can't review",
+                        "text": f"{b['now'].get('detail') or b['now']['headline']} · {n}", "who": "operators"})
     for tid, merged in f.merged.items():
         if merged is False:
             t = f.state["tasks"][tid]

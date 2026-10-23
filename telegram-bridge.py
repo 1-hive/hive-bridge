@@ -78,10 +78,7 @@ ALLOW = json.loads((CFG / "telegram.json").read_text())
 # Group chats (hive-bridge docs/design.md), optional: without this file the bridge serves only the
 # operator's private chat (ALLOW), as before. With it, allowed humans and known bots in group chats:
 # {"chats": [{"name", "chat_id", "private": false, "mode": "all" | "mention"}],
-#  "humans": [{"name", "user_id", "permissions": ["operator"]}], "bots": [{"name", "user_id", "username", "actor",
-#  "wake"?: <chat name>}]}
-# A bot with "wake" gets an @-mention in that chat when the record has something for it (a task, an answer,
-# a review, a nudge): for agents that only look at the hive when asked (OpenClaw's hive-task), not polling.
+#  "humans": [{"name", "user_id", "permissions": ["operator"]}], "bots": [{"name", "user_id", "username", "actor"}]}
 # mode "all" (the work group): every human message goes to the chief of staff. mode "mention" (a conversation
 # group): only messages that @-mention the bridge's bot or reply to it, from humans and from known bots.
 # Every message seen, in every listed chat, goes to the dialogue log (.telegram/dialogue.jsonl).
@@ -969,53 +966,6 @@ def push_origins(st: dict) -> None:
     save_state(st)
 
 
-WAKE_WHY = {   # record event -> (whose turn it is, what to tell them)
-    "task.assigned": (lambda e, d: d.get("to"), "a new task for you"),
-    "task.reassigned": (lambda e, d: d.get("to"), "a task reassigned to you"),
-    "task.answered": (None, "the answer to your question"),
-    "task.nudged": (None, "a nudge from the supervisor"),
-    "review.assigned": (lambda e, d: d.get("reviewer"), "a result for you to review"),
-    "review.recorded": (None, "a review of your result"),
-}
-
-
-def push_wakes(st: dict) -> None:
-    """@-mention a bot that has "wake" when the record has something for it."""
-    wakers = {b["actor"]: b for b in GROUPS.get("bots", []) if b.get("wake") and b.get("actor")}
-    if not wakers:
-        return
-    names = {c.get("name"): c["chat_id"] for c in GROUPS.get("chats", [])}
-    ok, out = hive("events", "--after", str(st.get("wake_pos", 0)))
-    if not ok:
-        return
-    evs = [json.loads(x) for x in out.splitlines() if x.strip()]
-    if "wake_pos" not in st:     # first run: start at the head
-        st["wake_pos"] = max([e["position"] for e in evs], default=0)
-        save_state(st)
-        return
-    for e in evs:
-        st["wake_pos"] = max(st["wake_pos"], e["position"])
-        why = WAKE_WHY.get(e["type"])
-        d = e.get("data") or {}
-        if not why or (e["type"] == "review.recorded" and d.get("verdict") == "passed"):
-            continue
-        who = why[0](e, d) if why[0] else None
-        if not who and e.get("task"):
-            okt, t = hive("task", e["task"])
-            try:
-                who = (json.loads(t).get("task") or {}).get("owner") if okt else None
-            except ValueError:
-                who = None
-        b = wakers.get(who)
-        if not b or b["wake"] not in names:
-            continue
-        safe("sendMessage", chat_id=names[b["wake"]],
-             text=f"@{b['username']} hive: {why[1]} ({e.get('task')}). Run `hive-task inbox` and act on it "
-                  f"as your hive skill says.")
-        log(f"wake: @{b['username']} for {e['type']} on {e.get('task')}")
-    save_state(st)
-
-
 def route_reply(reply: str, target: dict | None) -> tuple[str, dict | None]:
     """A reply that starts with [[to: <chat name>]] goes to that group chat instead (docs/design.md)."""
     first, _, rest = reply.partition("\n")
@@ -1099,7 +1049,6 @@ def main() -> None:
                     push_feed(st)
                 if CHATS:
                     push_origins(st)
-                    push_wakes(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)

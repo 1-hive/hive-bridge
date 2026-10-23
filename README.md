@@ -2,11 +2,11 @@
 
 Where humans meet a hive: a chat bridge (Telegram first) and the Floor, a read-only live board. It's the human/agent half of One Hive release R7, shared by every hive; each hive brings only its configuration.
 
-**Status (2026-10-19):** extracted from [1-hive](https://github.com/1-hive/1-hive) with its history. Paths and ids are configuration (below); 1-hive runs it with the defaults. Group chats with several humans and bots work as in [`docs/design.md`](docs/design.md), when `telegram-groups.json` exists; without it, the bridge serves only the operator's private chat, as before.
+**Status (2026-10-23):** v0.5.0 adds the Floor's bots view and the pinned status (below). Earlier (2026-10-19): extracted from [1-hive](https://github.com/1-hive/1-hive) with its history. Paths and ids are configuration (below); 1-hive runs it with the defaults. Group chats with several humans and bots work as in [`docs/design.md`](docs/design.md), when `telegram-groups.json` exists; without it, the bridge serves only the operator's private chat, as before.
 
 - `telegram-bridge.py`: the operator's inbox and buttons, record pushes (approvals, escalations, unanswered questions, finished tasks, a daily digest), and chat with the chief of staff, who it wakes by fixed rules.
 - `telegram-say.py`: send the operator one message from the host.
-- `floor.py`, `floor/`: the Floor, a read-only board of goals, tasks and agents, with replay at any record position.
+- `floor.py`, `floor/`, `floor_bots.py`: the Floor, a read-only board, in a browser or inside Telegram. Two views: **bots** (one card per agent: what it is doing now, what it owes, its last 24 hours; for hives of long-lived agents) and **goals** (one lane per goal, with replay at any record position).
 
 **The design rule:** the bridge reports facts about each message (who sent it, what it replies to, its mentions) and never decides who it's for. One chief of staff, for the whole hive, interprets every human message and acts only through the record; workers never read the chat.
 
@@ -40,6 +40,19 @@ Optional `HIVE_CONFIG_DIR/telegram-groups.json`. Without it, nothing changes for
 - **Shadow evidence:** `HIVE_WORK_DIR/.telegram/addressee-rule.jsonl` logs what a mention-or-reply rule would have picked for each message. The rule never acts.
 - **Telegram setup:** add the bot to the group, and turn its privacy mode off (BotFather: `/setprivacy` → Disable). Otherwise Telegram shows it only commands and replies to its own messages.
 
+## The Floor's bots view
+
+Three sources, never mixed up, and every line from a fixed rule (`floor_bots.py`; no model, and no agent writes its own status):
+- **Now**, from **beacons**: each agent's sidecar or runner (hive-runtime v0.5.0, config `"beacon"`) posts every 30 s what the agent's own files say: the chat request it is answering (chat and message ids only), its queue, its route-hook episodes, its last step, an OpenClaw session's chat, a reviewer's current review or last failure. `POST /api/beacon`, signed with the agent's record key under the prefix `hive-beacon1` (never a valid record write). Never authoritative. No beacon for 150 s: offline.
+- **On its plate**, from the record: tasks assigned, in progress, blocked, in review, passed but not merged (the reviewed commit isn't on the default branch of the hive's bare clone, floor.json `clones_dir`).
+- **Who asked what**, from the bridge's dialogue log: a request's or a task's chat message (a task's `cause.external`, `telegram:<chat>/<message>`) gives the person, the chat and the first line. Direct messages: never their content.
+
+`floor.json` (in `HIVE_CONFIG_DIR`, or `FLOOR_CONFIG`): `view` (`bots` | `goals`), `names`, `initials`, `about`, `machines` ({machine: [actors]}), `chat_names`, `clones_dir`, `auth` (`telegram`, the default through a proxy, or `none`). `FLOOR_STATE_DIR` holds its beacon samples (default `HIVE_WORK_DIR/.floor`).
+
+**Access.** From loopback without a proxy header: open (the bridge, an SSH tunnel). Through an HTTPS proxy (it sets X-Forwarded-For): only the hive's operators, by Telegram Mini App data signed with the bot's token (the Floor needs only the derived key, `telegram-webapp.key`), or by a 30-day cookie from a 15-minute login link the bridge gives an operator in a private chat (`/floor`; shared secret `floor-session.secret`). Run the Floor as its own user, without the bridge's keys.
+
+**In Telegram** (bridge, with `FLOOR_BOARD=bots`, `FLOOR_URL`, `FLOOR_PUBLIC_URL`): a chat with `"status": true` in `telegram-groups.json` gets one status message, pinned once and edited in place when it changes (no notifications); `/board` answers with the same text; `/floor` (or `/start floor`) in an operator's private chat opens the Floor inside Telegram and gives a login link for a browser; the bot's menu button opens it too. `FLOOR_TG_APP` (a BotFather Mini App, `bot/app`) makes the group's button open it in one tap. The chief of staff's turns are logged for the Floor (`.telegram/cos-turns.jsonl`, `cos-now.json`).
+
 ## Tests
 
-`python3 tests/groups_sim.py` (group chats, the private chat, buttons) and `python3 tests/question_reminders_sim.py` (unanswered-question pushes). Both run against a fake Telegram and record.
+`python3 tests/groups_sim.py` (group chats, the private chat, buttons), `python3 tests/question_reminders_sim.py` (unanswered-question pushes) and `python3 tests/status_sim.py` (the pinned status, `/floor`, login links) run against a fake Telegram and record. `uv run --project ~/repos/hive-record python tests/floor_sim.py [--serve]` runs the Floor's bots view against a scratch proto-hive record (rootless Podman), with beacons, a dialogue log and both kinds of sign-in.

@@ -56,6 +56,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -561,7 +563,12 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if not text:
         return
     if text.split("@")[0] == "/board":
-        safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"])
+        safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"],
+             disable_web_page_preview=True, **floor_markup())
+        return
+    if text.split("@")[0] == "/floor" and FLOOR_PUBLIC:
+        safe("sendMessage", chat_id=chat["id"], text="The Floor opens from a private chat with me: tap below, then Start.",
+             reply_to_message_id=m["message_id"], **floor_markup())
         return
     rt = m.get("reply_to_message") or {}
     env = {"chat": {"id": chat["id"], "name": CHATS.get(chat["id"], {}).get("name", chat.get("title")),
@@ -591,10 +598,14 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if (m.get("chat") or {}).get("type") in ("group", "supergroup") and (m["chat"]["id"] in CHATS or m["chat"]["id"] == ALLOW["chat_id"]):
         on_group_message(m, st, chat_cmd)
         return
-    if not allowed(m.get("from") or {}, m.get("chat") or {}):
-        log(f"ignored message from {m.get('from', {}).get('id')}")
-        return
     text = (m.get("text") or "").strip()
+    frm, chat = m.get("from") or {}, m.get("chat") or {}
+    if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0] in ("/floor", "/start floor", "/board"):
+        private_floor(chat["id"], frm["id"], text)
+        return
+    if not allowed(frm, chat):
+        log(f"ignored message from {frm.get('id')}")
+        return
     reply_to = str((m.get("reply_to_message") or {}).get("message_id", ""))
     if reply_to in st["pending_reason"]:
         action, gid = st["pending_reason"].pop(reply_to)
@@ -608,10 +619,8 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
-                "/digest sends the digest now; /board shows what each agent is doing.")
-        return
-    if text == "/board":
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=board_text(), parse_mode="HTML")
+                "/digest sends the digest now; /board shows what each agent is doing"
+                + ("; /floor opens the Floor." if FLOOR_PUBLIC else "."))
         return
     if text == "/digest":
         send_digest(st)
@@ -637,8 +646,115 @@ def ago(s: float) -> str:
     return f"{s // 60}m" if s < 5400 else f"{s // 3600}h {s % 3600 // 60}m"
 
 
+FLOOR_PUBLIC = os.environ.get("FLOOR_PUBLIC_URL", "").rstrip("/")   # the Floor through its HTTPS proxy, if any
+FLOOR_APP = os.environ.get("FLOOR_TG_APP", "")                      # a BotFather Mini App link, e.g. mybot/floor
+BOARD_BOTS = os.environ.get("FLOOR_BOARD") == "bots"                 # /board and the pinned status: one line per agent
+
+
+def floor_get(path: str) -> dict:
+    with urllib.request.urlopen(f"{FLOOR}{path}", timeout=20) as r:
+        return json.load(r)
+
+
+def floor_markup() -> dict:
+    """A button that opens the Floor: the Mini App link if BotFather has one, else a private chat with this bot
+    (/start floor), where the Floor opens inside Telegram (web_app buttons work only in private chats)."""
+    if not FLOOR_PUBLIC:
+        return {}
+    url = f"https://t.me/{FLOOR_APP}" if FLOOR_APP else (f"https://t.me/{ME['username']}?start=floor" if ME.get("username") else "")
+    return {"reply_markup": {"inline_keyboard": [[{"text": "Open the Floor", "url": url}]]}} if url else {}
+
+
+def login_link(user_id: int, minutes: int = 15) -> str:
+    """The Floor's login link for a browser (floor.py checks it): valid `minutes`, then a 30-day cookie."""
+    secret = (CFG / "floor-session.secret").read_text().strip().encode()
+    exp = int(time.time()) + minutes * 60
+    sig = hmac.new(secret, f"login.{user_id}.{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{FLOOR_PUBLIC}/login?u={user_id}&e={exp}&s={sig}"
+
+
+def private_floor(chat_id: int, user_id: int, text: str) -> None:
+    """An operator's private chat: /board, or the Floor inside Telegram plus a login link for a browser."""
+    if text.split("@")[0] == "/board":
+        safe("sendMessage", chat_id=chat_id, text=board_text(), parse_mode="HTML", disable_web_page_preview=True)
+        return
+    if not FLOOR_PUBLIC:
+        safe("sendMessage", chat_id=chat_id, text="This hive's Floor isn't reachable from outside; /board shows what each agent is doing.")
+        return
+    try:
+        link = login_link(user_id)
+    except OSError as e:
+        log(f"floor login link: {e}")
+        link = None
+    rows = [[{"text": "Open the Floor", "web_app": {"url": FLOOR_PUBLIC + "/"}}]]
+    if link:
+        rows.append([{"text": "Open in a browser (link valid 15 min)", "url": link}])
+    safe("sendMessage", chat_id=chat_id, text="The Floor: what each agent is doing now, what it owes, and its day. "
+         "The browser link signs you in for 30 days on that browser; don't forward it.",
+         reply_markup={"inline_keyboard": rows})
+    log(f"floor: links for {user_id}")
+
+
+def push_status(st: dict) -> None:
+    """The work group's status message (chats with "status": true): one message, pinned once, edited in place
+    when the Floor's text changes, so it never notifies. A deleted message is sent again."""
+    chats = [c for c in CHATS.values() if c.get("status")]
+    if not chats or not BOARD_BOTS:
+        return
+    try:
+        text = floor_get("/api/status")["text"]
+    except Exception as e:
+        if time.time() - st.get("status_err_at", 0) > 3600:
+            log(f"status: the Floor isn't answering: {e}")
+            st["status_err_at"] = time.time()
+        return
+    msgs = st.setdefault("status_msg", {})
+    for c in chats:
+        cur = msgs.get(str(c["chat_id"]))
+        if cur and cur.get("text") == text:
+            continue
+        if cur:
+            try:
+                tg("editMessageText", chat_id=c["chat_id"], message_id=cur["message_id"], text=text, parse_mode="HTML",
+                   disable_web_page_preview=True, **floor_markup())
+                cur["text"] = text
+                save_state(st)
+                continue
+            except RuntimeError as e:
+                if "not modified" in str(e):
+                    cur["text"] = text
+                    continue
+                if not any(x in str(e) for x in ("not found", "can't be edited", "MESSAGE_ID_INVALID")):
+                    log(f"status edit in {c['name']}: {e}")
+                    continue
+        try:
+            m = tg("sendMessage", chat_id=c["chat_id"], text=text, parse_mode="HTML", disable_notification=True,
+                   disable_web_page_preview=True, **floor_markup())
+        except RuntimeError as e:
+            log(f"status in {c['name']}: {e}")
+            continue
+        msgs[str(c["chat_id"])] = {"message_id": m["message_id"], "text": text}
+        save_state(st)
+        if safe("pinChatMessage", chat_id=c["chat_id"], message_id=m["message_id"], disable_notification=True) is None:
+            log(f"status in {c['name']}: posted, but not pinned (make the bot an admin that may pin, or pin it by hand)")
+        else:
+            log(f"status in {c['name']}: posted and pinned")
+
+
+def set_menu_button() -> None:
+    """In every private chat with this bot, a menu button that opens the Floor inside Telegram."""
+    if FLOOR_PUBLIC:
+        safe("setChatMenuButton", menu_button={"type": "web_app", "text": "Floor", "web_app": {"url": FLOOR_PUBLIC + "/"}})
+
+
 def board_text() -> str:
-    """Open goals and tasks, with what each agent is doing now (from the Floor, tools/floor.py)."""
+    """What each agent is doing (the Floor's bots status), or, for a hive of goals, open goals and tasks with
+    what each agent is doing now (from the Floor, floor.py)."""
+    if BOARD_BOTS:
+        try:
+            return floor_get("/api/status")["text"]
+        except Exception as e:
+            return f"The Floor isn't answering ({esc(str(e))[:120]}). Check: systemctl status {hp.HIVE_ID}-floor"
     try:
         with urllib.request.urlopen(f"{FLOOR}/api/state", timeout=10) as r:
             st = json.load(r)
@@ -980,6 +1096,20 @@ def route_reply(reply: str, target: dict | None) -> tuple[str, dict | None]:
     return rest.strip(), {"chat_id": hit["chat_id"], "reply_to": None}
 
 
+def cos_turn(phase: str, started: float, chat, human: bool) -> None:
+    """For the Floor: cos-now.json while the chief of staff answers, and a line per turn in cos-turns.jsonl."""
+    try:
+        now_f = STATE.parent / "cos-now.json"
+        if phase == "start":
+            now_f.write_text(json.dumps({"since": started, "chat": chat, "human": human}))
+            return
+        now_f.unlink(missing_ok=True)
+        with (STATE.parent / "cos-turns.jsonl").open("a") as f:
+            f.write(json.dumps({"start": started, "end": time.time(), "chat": chat, "human": human}) + "\n")
+    except OSError as e:
+        log(f"cos turn log: {e}")
+
+
 def chat_worker() -> None:
     """Chat with the chief of staff, one message at a time across every chat, off the main loop."""
     while True:
@@ -987,6 +1117,8 @@ def chat_worker() -> None:
         if human:   # when cos starts on a human's message: the window for follow-ups (check_followups)
             HUMAN_TURN.write_text(str(time.time()))
         chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
+        started = time.time()
+        cos_turn("start", started, chat_id if target else None, human)
         try:
             safe("sendChatAction", chat_id=chat_id, action="typing")
             r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
@@ -995,6 +1127,7 @@ def chat_worker() -> None:
             reply = "(the chief of staff didn't answer in 16 minutes; try again)"
         except Exception as e:
             reply = f"(chat failed: {e})"
+        cos_turn("end", started, chat_id if target else None, human)
         log(f"chat: {len(text)} chars in, {len(reply)} out")
         reply = take_task_lines(reply, target)
         reply, target = route_reply(reply, target)
@@ -1036,6 +1169,7 @@ def main() -> None:
         except Exception as e:
             log(f"getMe failed: {e}")
     threading.Thread(target=chat_worker, daemon=True).start()
+    set_menu_button()
     log("bridge up")
     next_inbox = 0.0
     while True:
@@ -1049,6 +1183,7 @@ def main() -> None:
                     push_feed(st)
                 if CHATS:
                     push_origins(st)
+                    push_status(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)

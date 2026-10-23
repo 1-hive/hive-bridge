@@ -252,7 +252,8 @@ def main():
         (work / ".telegram" / "dialogue.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         fport = int(os.environ.get("FLOOR_SIM_PORT") or free_port())
         fenv = {**env, "HIVE_URL": base, "HIVE_ID": "proto-hive", "HIVE_CONFIG_DIR": str(cfg), "HIVE_WORK_DIR": str(work),
-                "FLOOR_KEY_FILE": str(cfg / "floor.key"), "FLOOR_CONFIG": str(cfg / "floor.json")}
+                "FLOOR_KEY_FILE": str(cfg / "floor.key"), "FLOOR_CONFIG": str(cfg / "floor.json"),
+                "HIVE_WORKSPACE_REPO": str(tmp / "workspace.git"), "FLOOR_MERGE_TTL": "0"}
         fl = subprocess.Popen([sys.executable, str(HERE / "floor.py"), "--port", str(fport)], env=fenv)
         procs.append(fl)
         fbase = f"http://127.0.0.1:{fport}"
@@ -330,6 +331,14 @@ def main():
         print("needs:", [n["title"] for n in needs["needs"]])
         assert any("Astra" in n["title"] for n in needs["needs"])
         assert any("tidy-tests" in n["title"] or "merge" in n["title"].lower() for n in needs["needs"]), needs
+        # a request from the chief of staff to the operators shows; a branch deleted on purpose is no longer a merge to do
+        commit("workspace", "hive-requests/more-memory-for-vm2.md", "# More memory\n", "request")
+        sh("git", "--git-dir", str(tmp / "hive-appliance.git"), "branch", "-D", "hive/tidy-tests")
+        code, needs = get(fbase, "/api/needs")
+        titles = [n["title"] for n in needs["needs"]]
+        print("needs after:", titles)
+        assert "Request from the chief of staff: more memory for vm2" in titles, titles
+        assert not any("tidy-tests" in t for t in titles), "a deleted branch isn't a merge to do"
         code, w = get(fbase, "/api/work")
         print("work:", [(s["name"], [i["id"] for i in s["items"]]) for s in w["stages"]])
         code, chats = get(fbase, "/api/chats")

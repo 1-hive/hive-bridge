@@ -67,11 +67,12 @@ class Facts:
 
     def __init__(self, *, state: dict, events: list[dict], beacons: dict, samples: dict, dialogue: list[dict],
                  groups: dict, conf: dict, floor_up: list[float], cos: dict | None = None,
-                 merged: dict | None = None, now: float | None = None):
+                 merged: dict | None = None, requests: list[str] | None = None, now: float | None = None):
         self.state, self.events, self.beacons, self.samples = state, events, beacons, samples
         self.dialogue, self.groups, self.conf, self.floor_up = dialogue, groups, conf, floor_up
         self.cos = cos or {}
         self.merged = merged or {}           # task -> False when its reviewed code isn't on main yet
+        self.requests = requests or []       # the chief of staff's open requests to the operators (hive-requests/)
         self.now = now or time.time()
         self.chats = {c["chat_id"]: c for c in groups.get("chats", [])}
         self.humans = {h["user_id"]: h for h in groups.get("humans", [])}
@@ -557,7 +558,12 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         if merged is False:
             t = f.state["tasks"][tid]
             out.append({"tone": "ok", "title": f"Merge {tid}", "text": f"{f.name(t.get('owner'))}'s code passed review; "
-                        "its branch isn't on main yet (open or merge the pull request)", "who": "operators"})
+                        f"its branch hive/{tid} isn't on main yet: open and merge the pull request (a merge commit), "
+                        "or delete the branch if it shouldn't be merged", "who": "operators"})
+    for name in f.requests:
+        out.append({"tone": "warn", "title": f"Request from the chief of staff: {name.replace('-', ' ')}",
+                    "text": f"hive-requests/{name}.md in the workspace; move it to hive-requests/done/ once handled",
+                    "who": "operators"})
     return out
 
 

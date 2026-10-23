@@ -304,6 +304,7 @@ def cos_turns() -> dict:
 # --- merged or not: a reviewed commit on its repository's default branch -------------------------
 
 _merged: dict = {}   # task -> (checked at, True/False/None)
+MERGE_TTL = int(os.environ.get("FLOOR_MERGE_TTL", 300))   # seconds a merge verdict is reused
 
 
 def merged_map(st: dict, evs: list[dict]) -> dict:
@@ -324,7 +325,7 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
         if not code:
             continue
         hit = _merged.get(t["id"])
-        if hit and time.time() - hit[0] < 300:
+        if hit and time.time() - hit[0] < MERGE_TTL:
             if hit[1] is not None:
                 out[t["id"]] = hit[1]
             continue
@@ -340,7 +341,12 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
             ref = head.stdout.strip() or "HEAD"
             r = subprocess.run(["git", "-C", str(clone), "merge-base", "--is-ancestor", sha, ref], capture_output=True, env=env)
             if r.returncode == 1:
-                verdict = False
+                # not on main: still waiting for a merge, unless its task branch is gone from the remote
+                # (people decided not to merge it and deleted the branch: nothing left to do)
+                br = f"refs/heads/hive/{t['id']}"
+                gone = subprocess.run(["git", "-C", str(clone), "ls-remote", "--exit-code", "origin", br],
+                                      capture_output=True, env=env, timeout=30).returncode == 2
+                verdict = None if gone else False
             elif r.returncode != 0:
                 verdict = None
                 break
@@ -359,7 +365,16 @@ def facts() -> fb.Facts:
         samples = {a: list(s) for a, s in SAMPLES.items()}
         up = list(FLOOR_UP)
     return fb.Facts(state=st, events=evs, beacons=beacons, samples=samples, dialogue=dialogue(), groups=GROUPS,
-                    conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs))
+                    conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs), requests=open_requests())
+
+
+def open_requests() -> list[str]:
+    """The chief of staff's requests to the operators: hive-requests/*.md on the workspace's main, not yet
+    moved into hive-requests/done/ (as the bridge's digest lists them)."""
+    r = subprocess.run(["git", "-C", str(hp.WORKSPACE_REPO), "ls-tree", "--name-only", "main", "hive-requests/"],
+                       capture_output=True, text=True,
+                       env={**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"})
+    return [Path(x).stem for x in r.stdout.split() if x.endswith(".md")] if r.returncode == 0 else []
 
 
 def roster(f: fb.Facts) -> list[dict]:

@@ -251,6 +251,7 @@ function card(b) {
       <div class="head"><span class="dot k-${esc(n.kind)}${n.active ? " pulse" : ""}"></span><span class="text">${esc(n.headline)}</span></div>
       ${n.detail ? `<span class="quote indent">${esc(n.detail)}</span>` : ""}
       ${n.facts ? `<span class="small indent">${esc(n.facts)}</span>` : ""}
+      ${b.note ? `<span class="small indent" style="color:var(--bad)">beacon: ${esc(b.note)}</span>` : ""}
     </div>
     <div class="plate"><span class="label">On its plate</span>${plateHtml(b)}${b.queued ? `<span class="queue">${b.queued} more message${b.queued > 1 ? "s" : ""} waiting in its queue</span>` : ""}</div>
     <div style="display:flex;flex-direction:column;gap:7px"><div class="strip-head"><span style="letter-spacing:1.2px">LAST 24 H</span><span>${esc(splitText(b.day.split))}</span></div>${strip(b.day)}</div>

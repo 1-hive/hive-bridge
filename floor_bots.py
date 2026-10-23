@@ -442,6 +442,7 @@ def bot(f: Facts, actor: str, detail: bool = False) -> dict:
         "code": {"at": code[-1][0], "text": f"own code changed at {time.strftime('%H:%M', time.gmtime(code[-1][0]))} UTC"}
         if code else None,
         "decl": decl.get("harness") or "",
+        "note": body.get("problem") if body.get("kind") != "reviewer" else None,   # e.g. its sidecar can't read a file
         "beacon_age": (f.now - f.beacons[actor]["received"]) if actor in f.beacons else None,
     }
     if detail:

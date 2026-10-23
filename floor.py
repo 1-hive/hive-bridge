@@ -225,8 +225,8 @@ def take_beacon(headers, raw: bytes) -> tuple[int, str]:
     if not verify(key, msg, sig):
         return 403, "bad signature"
     actor = next((a for a, v in state()["actors"].items() if v.get("status") == "active" and key in v.get("keys", [])), None)
-    if actor is None:
-        _state["value"] = None   # maybe a key added since the last read
+    if actor is None and time.time() - _state.get("forced", 0) > 30:
+        _state["value"], _state["forced"] = None, time.time()   # maybe a key added since the last read (at most every 30 s)
         actor = next((a for a, v in state()["actors"].items() if v.get("status") == "active" and key in v.get("keys", [])), None)
     try:
         body = json.loads(raw)

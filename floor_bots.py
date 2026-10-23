@@ -234,6 +234,8 @@ def plate(f: Facts, actor: str, cls: str) -> list[dict]:
 def request_line(f: Facts, req: dict) -> tuple[str, str, str]:
     """(state, headline, detail) for a chat request the agent is answering."""
     chat, mid = req.get("chat_id"), req.get("message_id")
+    if chat is None:   # its sidecar can see a request in progress but not read it
+        return "chat", "Answering a chat message", ""
     if isinstance(chat, int) and chat > 0:
         return "private", "In a private chat", "Content not shown: direct messages stay private."
     d = f.msgs.get((chat, mid))

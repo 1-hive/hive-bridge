@@ -1076,10 +1076,50 @@ def push_origins(st: dict) -> None:
             continue
         safe("sendMessage", chat_id=o[t]["chat_id"], text=f"{t}: {f(e, e.get('data') or {})}"[:1000],
              reply_to_message_id=o[t]["message_id"], allow_sending_without_reply=True)
+        if e["type"] == "task.closed":
+            send_result(t, o[t])
         if e["type"] in ("task.closed", "task.cancelled"):
             del o[t]
     save_origins(o)
     save_state(st)
+
+
+def result_text(pin: dict) -> str | None:
+    """A workspace pin's file, from the workspace repository at its commit."""
+    if (pin or {}).get("repository") != "workspace" or not pin.get("path"):
+        return None
+    commit = str(pin.get("commit_oid", "")).split(":")[-1]
+    r = subprocess.run(["git", "-C", str(WORKSPACE), "show", f"{commit}:{pin['path']}"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def send_result(task: str, origin: dict) -> None:
+    """A chat-started task is done: its result report goes back to the message it came from, as a file to
+    download, with the code it changed named (repository, commit, the task's branch)."""
+    ok, out = hive("task", task)
+    if not ok:
+        return
+    j = json.loads(out)
+    t = j.get("task", j)
+    cr = t.get("current_result") or {}
+    text = result_text(cr.get("pin") or {})
+    if not text:
+        return
+    code = []
+    res = next((ev for ev in reversed(j.get("events") or []) if ev.get("event_id") == cr.get("event_id")), None)
+    for r in (res or {}).get("refs") or []:
+        if r.get("rel") == "code":
+            code.append(f"{r['pin']['repository']} {str(r['pin']['commit_oid']).split(':')[-1][:10]} (branch hive/{task})")
+    f = STATE.parent / "results" / f"{task}.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text)
+    caption = f"{task}: the result" + (f"; code: {', '.join(code)}" if code else "")
+    try:
+        tg_file("sendDocument", "document", f, chat_id=origin["chat_id"], caption=caption[:1000],
+                reply_to_message_id=origin["message_id"], allow_sending_without_reply="true")
+        log(f"result of {task} sent to {origin['chat_id']}")
+    except Exception as ex:
+        log(f"result of {task}: {ex}")
 
 
 def route_reply(reply: str, target: dict | None) -> tuple[str, dict | None]:

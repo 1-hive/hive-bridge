@@ -162,9 +162,27 @@ def main():
         (54, "task.closed", "cos", {}), (55, "task.closed", "cos", {"task": "other"})]]
     evs[-1]["task"] = "t1"
     st["origin_pos"] = 49
-    b.hive = lambda *a: (True, "\n".join(json.dumps(e) for e in evs)) if a[0] == "events" else (True, "{}")
+    # the result's report, in a workspace repository, for the file sent back on close
+    import subprocess
+    ws = Path(tempfile.mkdtemp())
+    genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / "r.md").write_text("# The summary\n\nAll of it.\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "r"], check=True, env=genv)
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    b.WORKSPACE = ws
+    t9 = {"task": {"id": "t9", "current_result": {"event_id": "e52", "pin": {"repository": "workspace", "commit_oid": f"sha1:{head}", "path": "r.md"}}},
+          "events": [{"event_id": "e52", "type": "task.result_posted", "refs": [{"rel": "code", "pin": {"repository": "app", "commit_oid": "sha1:abcdef1234567890"}}]}]}
+    b.hive = lambda *a: ((True, "\n".join(json.dumps(e) for e in evs)) if a[0] == "events"
+                         else (True, json.dumps(t9)) if a[:2] == ("task", "t9") else (True, "{}"))
+    docs = []
+    b.tg_file = lambda method, field, f, **p: docs.append((method, f.read_text(), p)) or {}
     sent.clear()
     b.push_origins(st)
+    check("t9's result goes back to its origin message as a file, naming its code", len(docs) == 1
+          and docs[0][0] == "sendDocument" and docs[0][1].startswith("# The summary") and docs[0][2]["reply_to_message_id"] == 12
+          and docs[0][2]["chat_id"] == GROUP and "app abcdef1234 (branch hive/t9)" in docs[0][2]["caption"], docs)
     lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     check("t9's progress is threaded on its origin message", lines == [
         (GROUP, 12, "t9: started"), (GROUP, 12, "t9: result posted, waiting for review"),

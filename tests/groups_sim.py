@@ -188,6 +188,22 @@ def main():
         (GROUP, 12, "t9: started"), (GROUP, 12, "t9: result posted, waiting for review"),
         (GROUP, 12, "t9: review passed (worker.bot1)"), (GROUP, 12, "t9: done ✅")], lines)
     check("t9's origin is dropped once done", "t9" not in b.load_origins(), b.load_origins())
+    # a task a bot proposed from a chat message (proposal.submitted with cause telegram:<chat>/<msg>): threaded there
+    pevs = [{"position": 60, "type": "proposal.submitted", "actor": {"id": "worker.bot1"}, "cause": {"external": f"telegram:{GROUP}/77"},
+             "data": {"proposal_id": "pp1", "approver_class": "chief_of_staff", "proposed": {"data": {"title": "Summarize X"}}}},
+            {"position": 61, "type": "proposal.approved", "actor": {"id": "cos"}, "data": {"proposal_id": "pp1"}},
+            {"position": 62, "type": "task.created", "task": "pp1", "on_proposal": "pp1", "actor": {"id": "cos"}, "data": {}},
+            {"position": 63, "type": "task.accepted", "task": "pp1", "actor": {"id": "worker.bot1"}, "data": {}}]
+    st["origin_pos"] = 59
+    b.hive = lambda *a: (True, "\n".join(json.dumps(e) for e in pevs)) if a[0] == "events" else (True, "{}")
+    sent.clear()
+    b.push_origins(st)
+    lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    check("a proposed task is threaded on the message its proposal cited", lines == [(GROUP, 77, "pp1: started")], lines)
+    ping = b.PINGS["proposal.submitted"][1]
+    check("the chief of staff is woken for a proposal to it", "Summarize X" in (ping(pevs[0]) or "")
+          and f"telegram:{GROUP}/77" in ping(pevs[0]), ping(pevs[0]))
+    check("not for a proposal to someone else", ping({**pevs[0], "data": {**pevs[0]["data"], "approver_class": "operator"}}) is None)
     sent.clear()
     b.CHAT.put(("cat >/dev/null; printf 'ok\\n[[task: t10]]'", "x", False, None))
     run_worker_once(b)

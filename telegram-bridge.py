@@ -805,6 +805,12 @@ PINGS = {   # record event -> (state cursor, message to the chief of staff, or N
                      f"(position {e['position']}, needs {(e.get('data') or {}).get('needs')}): "
                      f"{(e.get('data') or {}).get('reason', '')[:300]} Read the question, then answer it with a file in "
                      "questions/ and task.answered, or tell the human what they must decide. Reply in one line."),
+    "proposal.submitted": ("proposed_pos", lambda e: None if (e.get("data") or {}).get("approver_class") != "chief_of_staff" else
+                           f"{e['actor']['id']} proposes a task, {(e.get('data') or {}).get('proposal_id')} (position "
+                           f"{e['position']}): \"{((e.get('data') or {}).get('proposed') or {}).get('data', {}).get('title', '')}\""
+                           + (f", asked in chat ({(e.get('cause') or {}).get('external')})" if (e.get('cause') or {}).get('external') else "")
+                           + ". Read its order and decide as your doc says: approve and assign it, or reject it with a "
+                           "reason. Reply in one line with what you did."),
     "review.recorded": ("reviewed_pos", lambda e: None if (e.get("data") or {}).get("verdict") != "passed" else
                         f"Task {e['task']} passed its review (position {e['position']}). Read the review, close "
                         "the task, and complete the goal if it was the last one. Reply in one line with what you did."),
@@ -1071,6 +1077,18 @@ def push_origins(st: dict) -> None:
         return
     for e in evs:
         st["origin_pos"] = max(st["origin_pos"], e["position"])
+        if e["type"] == "task.created" and e.get("on_proposal") and e.get("task") not in o:
+            # a task a bot proposed from a chat message: its progress and result go back to that message
+            src = next((x for x in evs if x["type"] == "proposal.submitted"
+                        and (x.get("data") or {}).get("proposal_id") == e["on_proposal"]), None)
+            if src is None:
+                okp, outp = hive("events", "--type", "proposal.submitted")
+                src = next((x for x in (json.loads(l) for l in outp.splitlines() if l.strip()) if okp
+                            and (x.get("data") or {}).get("proposal_id") == e["on_proposal"]), None) if okp else None
+            m = re.match(r"^telegram:(-?\d+)/(\d+)$", ((src or {}).get("cause") or {}).get("external") or "")
+            if m:
+                o[e["task"]] = {"chat_id": int(m.group(1)), "message_id": int(m.group(2))}
+                log(f"origin of {e['task']}: proposal {e['on_proposal']}, message {m.group(2)} in {m.group(1)}")
         t, f = e.get("task"), ORIGIN_NOTES.get(e["type"])
         if not (t and f and t in o):
             continue

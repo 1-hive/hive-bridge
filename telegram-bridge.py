@@ -1089,6 +1089,12 @@ def push_origins(st: dict) -> None:
             if m:
                 o[e["task"]] = {"chat_id": int(m.group(1)), "message_id": int(m.group(2))}
                 log(f"origin of {e['task']}: proposal {e['on_proposal']}, message {m.group(2)} in {m.group(1)}")
+        elif e["type"] == "task.created" and e.get("task") not in o:
+            # a task filed citing a chat message (e.g. the chief of staff refiling a bot's proposal as its own order)
+            m = re.match(r"^telegram:(-?\d+)/(\d+)$", (e.get("cause") or {}).get("external") or "")
+            if m:
+                o[e["task"]] = {"chat_id": int(m.group(1)), "message_id": int(m.group(2))}
+                log(f"origin of {e['task']}: message {m.group(2)} in {m.group(1)}")
         t, f = e.get("task"), ORIGIN_NOTES.get(e["type"])
         if not (t and f and t in o):
             continue
@@ -1137,7 +1143,15 @@ def send_result(task: str, origin: dict) -> None:
                 reply_to_message_id=origin["message_id"], allow_sending_without_reply="true")
         log(f"result of {task} sent to {origin['chat_id']}")
     except Exception as ex:
-        log(f"result of {task}: {ex}")
+        # the origin may be a chat this bot can't post in (a private chat with another bot): the work group gets it
+        work = next((c for c in CHATS.values() if c.get("mode", "all") == "all" and not c.get("private")), None)
+        log(f"result of {task}: {ex}" + (f"; sending it to {work['chat_id']}" if work else ""))
+        if work and work["chat_id"] != origin["chat_id"]:
+            try:
+                tg_file("sendDocument", "document", f, chat_id=work["chat_id"],
+                        caption=f"{caption} (asked in chat {origin['chat_id']}, which I can't post in)"[:1000])
+            except Exception as ex2:
+                log(f"result of {task} to the work group: {ex2}")
 
 
 def route_reply(reply: str, target: dict | None) -> tuple[str, dict | None]:

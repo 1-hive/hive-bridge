@@ -200,6 +200,28 @@ def main():
     b.push_origins(st)
     lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     check("a proposed task is threaded on the message its proposal cited", lines == [(GROUP, 77, "pp1: started")], lines)
+    # the chief of staff refiles a proposal as its own task, citing the same message (a private chat with another bot)
+    DM = 4242
+    revs = [{"position": 70, "type": "task.created", "task": "t11", "cause": {"external": f"telegram:{DM}/33"}, "actor": {"id": "cos"}, "data": {}},
+            {"position": 71, "type": "task.accepted", "task": "t11", "actor": {"id": "worker.bot1"}, "data": {}},
+            {"position": 72, "type": "task.closed", "task": "t11", "actor": {"id": "cos"}, "data": {}}]
+    st["origin_pos"] = 69
+    t11 = {"task": {"id": "t11", "current_result": {"event_id": "e9", "pin": {"repository": "workspace", "commit_oid": f"sha1:{head}", "path": "r.md"}}},
+           "events": []}
+    b.hive = lambda *a: ((True, "\n".join(json.dumps(e) for e in revs)) if a[0] == "events"
+                         else (True, json.dumps(t11)) if a[:2] == ("task", "t11") else (True, "{}"))
+    def tg_file(method, field, f, **p):
+        if p["chat_id"] == DM:
+            raise RuntimeError("Forbidden: bot can't initiate conversation with a user")
+        docs.append((method, f.read_text(), p))
+    b.tg_file = tg_file
+    sent.clear(); docs.clear()
+    b.push_origins(st)
+    lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    check("a task filed citing a chat message is threaded there", lines[:1] == [(DM, 33, "t11: started")], lines)
+    wg = next(c["chat_id"] for c in b.CHATS.values() if c.get("mode", "all") == "all" and not c.get("private"))
+    check("a result its origin chat can't take goes to the work group", len(docs) == 1 and docs[0][2]["chat_id"] == wg
+          and f"asked in chat {DM}" in docs[0][2]["caption"], docs)
     ping = b.PINGS["proposal.submitted"][1]
     check("the chief of staff is woken for a proposal to it", "Summarize X" in (ping(pevs[0]) or "")
           and f"telegram:{GROUP}/77" in ping(pevs[0]), ping(pevs[0]))

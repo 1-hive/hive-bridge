@@ -1072,16 +1072,25 @@ def status_text(task: str, steps: list) -> str:
     return f"{task}: {' → '.join(shown)}"[:4000]
 
 
+STATUS_EDIT_FOR = 47 * 3600   # Telegram lets a bot edit its group message for 48 hours
+
+
 def show_status(task: str, origin: dict) -> None:
-    """The task's one status message: posted on its origin message the first time, edited in place after."""
+    """The task's one status message: posted on its origin message the first time, edited in place after. A
+    message too old to edit, or one that can't be edited (deleted), is replaced by a new one, which then counts."""
     text = status_text(task, origin.get("steps") or [])
-    if origin.get("status_id"):
-        safe("editMessageText", chat_id=origin["chat_id"], message_id=origin["status_id"], text=text)
-        return
+    if origin.get("status_id") and time.time() - origin.get("status_at", time.time()) < STATUS_EDIT_FOR:
+        try:
+            tg("editMessageText", chat_id=origin["chat_id"], message_id=origin["status_id"], text=text)
+            return
+        except Exception as e:
+            if "not modified" in str(e):
+                return
+            log(f"status of {task}: {e}; posting a new one")
     m = safe("sendMessage", chat_id=origin["chat_id"], text=text, reply_to_message_id=origin["message_id"],
              allow_sending_without_reply=True)
     if m and m.get("message_id"):
-        origin["status_id"] = m["message_id"]
+        origin["status_id"], origin["status_at"] = m["message_id"], time.time()
 
 
 def push_origins(st: dict) -> None:

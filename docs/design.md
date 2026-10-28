@@ -67,7 +67,7 @@ It acts **only through the record**, then replies in the thread:
 
 ## Results back into the chat
 
-When the chief of staff creates a task for a chat message, its reply carries a line `[[task: <task id>]]`, which the bridge takes out of the visible reply. The bridge remembers which message the task came from, and replies there with one status message for the task, edited in place as it moves: started, result posted, each review round's verdict, done or cancelled. A question from the worker and the result report are messages of their own, since someone has to act on them. The bridge keeps a done task's origin for a week, so the publisher's PR link (telegram-say.py with `HIVE_TASK`) goes to the same thread as well as to the operator.
+When the chief of staff creates a task for a chat message, its reply carries a line `[[task: <task id>]]`, which the bridge takes out of the visible reply. The bridge remembers which message the task came from, and replies there with one status message for the task, edited in place as it moves: started, result posted, each review round's verdict, done or cancelled. Once it is too old to edit (Telegram allows 48 hours) or can't be edited, a new status message replaces it. A question from the worker and the result report are messages of their own, since someone has to act on them. The bridge keeps a done task's origin for a week, so the publisher's PR link (telegram-say.py with `HIVE_TASK`) goes to the same thread as well as to the operator.
 
 The origin stays in the bridge (`HIVE_WORK_DIR/.telegram/origins.json`), not on the record. It's chat bookkeeping, and the core profile allows no `ext` fields on a task. A worker with its own chat identity may still post its full answer itself.
 

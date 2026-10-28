@@ -195,7 +195,7 @@ def main():
     check("a posted result shows only while it waits", b.status_text("t", steps)
           == "t: started → review 1 failed → result posted, waiting for review", b.status_text("t", steps))
     o = b.load_origins()
-    o["tq"] = {"chat_id": GROUP, "message_id": 13, "status_id": 9500, "steps": [["task.accepted", "started"]]}
+    o["tq"] = {"chat_id": GROUP, "message_id": 13, "status_id": 9500, "status_at": time.time(), "steps": [["task.accepted", "started"]]}
     b.save_origins(o)
     qevs = [{"position": 56, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
              "data": {"needs": "operator", "reason": "which branch?"}},
@@ -210,6 +210,28 @@ def main():
     check("a question is a message of its own, on the status message", lines == [(9500, "tq: has a question (operator): which branch?")], lines)
     check("later steps edit the status message, review rounds numbered", len(edits) == 2 and edits[-1]
           == "tq: started → has a question (operator): which branch? → review 1 failed → review 2 passed", edits)
+    # a status message too old to edit (or one Telegram won't edit) is replaced by a new one
+    o = b.load_origins()
+    o["tq"]["status_at"] -= 48 * 3600
+    b.save_origins(o)
+    qevs[:] = [{"position": 59, "type": "task.closed", "task": "tq", "actor": {"id": "cos"}, "data": {}}]
+    st["origin_pos"] = 58
+    sent.clear()
+    b.push_origins(st)
+    lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    check("a stale status message is replaced by a new one on the origin message", not [m for m, _ in sent if m == "editMessageText"]
+          and lines == [(13, "tq: started → has a question (operator): which branch? → review 1 failed → review 2 passed → done ✅")]
+          and b.load_origins()["tq"]["status_id"] != 9500, (sent, b.load_origins()["tq"]))
+    def refuse(method, **p):
+        if method == "editMessageText":
+            raise RuntimeError("telegram editMessageText: Bad Request: message to edit not found")
+        sent.append((method, p))
+        return {"message_id": 9700}
+    keep, b.tg, b.safe, sent[:] = (b.tg, b.safe), refuse, refuse, []
+    o = b.load_origins()
+    b.show_status("tq", o["tq"])
+    check("a status message Telegram won't edit is replaced too", [m for m, _ in sent] == ["sendMessage"] and o["tq"]["status_id"] == 9700, (sent, o["tq"]))
+    b.tg, b.safe = keep
     o = b.load_origins()
     o["t9"]["closed"] -= 8 * 86400
     b.save_origins(o)

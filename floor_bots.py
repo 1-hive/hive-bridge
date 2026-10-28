@@ -314,8 +314,13 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
             state, head, detail = request_line(f, {"chat_id": body["chat"]["chat_id"]})
             return {"state": state, "headline": head.replace("Answering a message in", "Chatting in"), "detail": detail,
                     "since": since, "facts": " · ".join(facts), "active": True}
-        return {"state": "own", "headline": "On its own agenda",
-                "detail": "Working on something that came neither from chat nor from the hive.",
+        # the beacon saw activity (a model call, or only a file the agent wrote) but no chat request and no hive task:
+        # say what was seen, not a guess at intent
+        detail = ("Its model is running, but not for a chat message or a hive task: its own upkeep or a scheduled job."
+                  if ep else f"Its files changed {dur(f.now - step)} ago, but it isn't answering a chat message or working "
+                  "on a hive task: most likely upkeep (memory, a scheduled job) or noting a message it didn't answer.")
+        return {"state": "own", "headline": "Active, not on a chat or a task",
+                "detail": detail,
                 "since": since, "facts": " · ".join(facts), "active": True}
     last = max([x for x in (step, body.get("last_answer")) if x] or [0]) or None
     if blocked:

@@ -354,8 +354,28 @@ def cos_turns() -> dict:
 
 # --- merged or not: a reviewed commit on its repository's default branch -------------------------
 
-_merged: dict = {}   # task -> (checked at, True/False/None)
+_merged: dict = {}   # task -> (checked at, True/False/None, the branch it merges into)
 MERGE_TTL = int(os.environ.get("FLOOR_MERGE_TTL", 300))   # seconds a merge verdict is reused
+
+
+MERGE_INTO: dict = {}   # task -> the branch its reviewed code merges into (main, protomega...)
+
+
+def target_branch(clone: Path, base: str | None, env: dict) -> str:
+    """The branch a result merges into, as the publisher picks its pull request's: the default branch if it holds the
+    result's base, else the first other branch (not hive/*) that does; an agent working from its own line (sidecar
+    "base_branches", e.g. iter's protomega) merges there, not into the default branch."""
+    def git(*a):
+        return subprocess.run(["git", "-C", str(clone), *a], capture_output=True, text=True, env=env)
+    default = git("symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+    if not base or not re.fullmatch(r"[0-9a-f]{7,64}", base):
+        return default or "HEAD"
+    branches = [b for b in git("for-each-ref", "--format=%(refname:short)", "refs/heads").stdout.split()
+                if not b.startswith("hive/")]
+    for b in ([default] if default in branches else []) + [b for b in branches if b != default]:
+        if git("merge-base", "--is-ancestor", base, b).returncode == 0:
+            return b
+    return default or "HEAD"
 
 
 def merged_map(st: dict, evs: list[dict]) -> dict:
@@ -373,14 +393,17 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
             continue
         ev = results.get(cr.get("event_id"))
         code = [r["pin"] for r in (ev or {}).get("refs", []) if r.get("rel") == "code"]
+        bases = {r["pin"].get("repository"): r["pin"].get("commit_oid", "").split(":")[-1]
+                 for r in (ev or {}).get("refs", []) if r.get("rel") == "base" and r.get("pin")}
         if not code:
             continue
         hit = _merged.get(t["id"])
         if hit and time.time() - hit[0] < MERGE_TTL:
             if hit[1] is not None:
                 out[t["id"]] = hit[1]
+                MERGE_INTO[t["id"]] = hit[2]
             continue
-        verdict = True
+        verdict, into = True, None
         for pin in code:
             repo, sha = pin.get("repository"), pin.get("commit_oid", "").split(":")[-1]
             clone = Path(clones) / repo
@@ -388,8 +411,7 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
                 verdict = None
                 break
             env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
-            head = subprocess.run(["git", "-C", str(clone), "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, env=env)
-            ref = head.stdout.strip() or "HEAD"
+            ref = into = target_branch(clone, bases.get(repo), env)
             r = subprocess.run(["git", "-C", str(clone), "merge-base", "--is-ancestor", sha, ref], capture_output=True, env=env)
             if r.returncode == 1:
                 # not on main: still waiting for a merge, unless its task branch is gone from the remote
@@ -401,9 +423,10 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
             elif r.returncode != 0:
                 verdict = None
                 break
-        _merged[t["id"]] = (time.time(), verdict)
+        _merged[t["id"]] = (time.time(), verdict, into)
         if verdict is not None:
             out[t["id"]] = verdict
+            MERGE_INTO[t["id"]] = into
     return out
 
 
@@ -416,7 +439,8 @@ def facts() -> fb.Facts:
         samples = {a: list(s) for a, s in SAMPLES.items()}
         up = list(FLOOR_UP)
     return fb.Facts(state=st, events=evs, beacons=beacons, samples=samples, dialogue=dialogue(), groups=GROUPS,
-                    conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs), requests=open_requests())
+                    conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs), merge_into=dict(MERGE_INTO),
+                    requests=open_requests())
 
 
 def open_requests() -> list[str]:

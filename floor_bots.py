@@ -67,11 +67,12 @@ class Facts:
 
     def __init__(self, *, state: dict, events: list[dict], beacons: dict, samples: dict, dialogue: list[dict],
                  groups: dict, conf: dict, floor_up: list[float], cos: dict | None = None,
-                 merged: dict | None = None, requests: list[str] | None = None, now: float | None = None):
+                 merged: dict | None = None, merge_into: dict | None = None, requests: list[str] | None = None, now: float | None = None):
         self.state, self.events, self.beacons, self.samples = state, events, beacons, samples
         self.dialogue, self.groups, self.conf, self.floor_up = dialogue, groups, conf, floor_up
         self.cos = cos or {}
-        self.merged = merged or {}           # task -> False when its reviewed code isn't on main yet
+        self.merged = merged or {}           # task -> False when its reviewed code isn't on its branch yet
+        self.merge_into = merge_into or {}   # task -> that branch (main, or an agent's own line such as protomega)
         self.requests = requests or []       # the chief of staff's open requests to the operators (hive-requests/)
         self.now = now or time.time()
         self.chats = {c["chat_id"]: c for c in groups.get("chats", [])}
@@ -208,7 +209,7 @@ def plate(f: Facts, actor: str, cls: str) -> list[dict]:
                     sub += f"; {f.name(rv)} can't run"
                 out.append({"stage": "In review", "task": t["id"], "sub": sub})
             elif st == "done" and f.merged.get(t["id"]) is False:
-                out.append({"stage": "Merge", "task": t["id"], "sub": "review passed; its code isn't on main yet"})
+                out.append({"stage": "Merge", "task": t["id"], "sub": f"review passed; its code isn't on {f.merge_into.get(t['id']) or 'main'} yet"})
         elif cls == "reviewer" and t.get("assigned_reviewer") == actor and st == "in_review":
             cr = t.get("current_result") or {}
             lr = t.get("latest_review") or {}
@@ -558,7 +559,7 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         if merged is False:
             t = f.state["tasks"][tid]
             out.append({"tone": "ok", "title": f"Merge {tid}", "text": f"{f.name(t.get('owner'))}'s code passed review; "
-                        f"its branch hive/{tid} isn't on main yet: open and merge the pull request (a merge commit), "
+                        f"its branch hive/{tid} isn't on {f.merge_into.get(tid) or 'main'} yet: open and merge the pull request (a merge commit), "
                         "or delete the branch if it shouldn't be merged", "who": "operators"})
     for name in f.requests:
         out.append({"tone": "warn", "title": f"Request from the chief of staff: {name.replace('-', ' ')}",

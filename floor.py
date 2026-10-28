@@ -155,6 +155,7 @@ def state() -> dict:
 
 BEACONS: dict[str, dict] = {}         # actor -> {"body", "received"}
 SAMPLES: dict[str, list[dict]] = {}   # actor -> compact samples of the last day (for the day strip)
+STARTED = time.time()                 # a restart forgets the last beacons until each agent's next one: not offline meanwhile
 FLOOR_UP: list[float] = []            # the Floor's own minutes up: a missing beacon counts only while it listened
 SAMPLE_LOG = FLOOR_DIR / "samples.jsonl"
 
@@ -465,7 +466,7 @@ def facts() -> fb.Facts:
         up = list(FLOOR_UP)
     return fb.Facts(state=st, events=evs, beacons=beacons, samples=samples, dialogue=dialogue(), groups=GROUPS,
                     conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs), merge_into=dict(MERGE_INTO),
-                    requests=open_requests())
+                    requests=open_requests(), started=STARTED)
 
 
 def open_requests() -> list[dict]:

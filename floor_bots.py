@@ -67,7 +67,8 @@ class Facts:
 
     def __init__(self, *, state: dict, events: list[dict], beacons: dict, samples: dict, dialogue: list[dict],
                  groups: dict, conf: dict, floor_up: list[float], cos: dict | None = None,
-                 merged: dict | None = None, merge_into: dict | None = None, requests: list[dict] | None = None, now: float | None = None):
+                 merged: dict | None = None, merge_into: dict | None = None, requests: list[dict] | None = None, now: float | None = None,
+                 started: float = 0.0):
         self.state, self.events, self.beacons, self.samples = state, events, beacons, samples
         self.dialogue, self.groups, self.conf, self.floor_up = dialogue, groups, conf, floor_up
         self.cos = cos or {}
@@ -75,6 +76,7 @@ class Facts:
         self.merge_into = merge_into or {}   # task -> {into: that branch (main, or a line such as protomega), repo, branch, url}
         self.requests = requests or []       # the chief of staff's open requests to the operators: {name, text}
         self.now = now or time.time()
+        self.started = started               # when this Floor process started: a beacon isn't missing before it could arrive
         self.chats = {c["chat_id"]: c for c in groups.get("chats", [])}
         self.humans = {h["user_id"]: h for h in groups.get("humans", [])}
         self.bot_ids = {b["user_id"]: b.get("actor") for b in groups.get("bots", []) if b.get("actor")}
@@ -272,7 +274,7 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
                     "detail": f"No activity data: its {sender} sends no beacons yet.", "active": False}
         return {"state": "nodata", "headline": "No activity data",
                 "detail": f"Its {sender} sends no beacons yet; what it owes below is still the record's.", "active": False}
-    if age > OFFLINE_AFTER:
+    if age > OFFLINE_AFTER and f.now - f.started > OFFLINE_AFTER:
         return {"state": "offline", "headline": f"Offline for {dur(age)}", "since": b["received"],
                 "detail": f"No word from its {'runner' if cls == 'reviewer' else 'sidecar'} since "
                           f"{time.strftime('%H:%M', time.gmtime(b['received']))} UTC.", "active": False}
@@ -660,7 +662,7 @@ def machines(f: Facts, roster: list[dict]) -> list[dict]:
         if not heard:
             status = "no beacons yet"
             ok = None
-        elif all(b["beacon_age"] > OFFLINE_AFTER for b in heard):
+        elif all(b["beacon_age"] > OFFLINE_AFTER for b in heard) and f.now - f.started > OFFLINE_AFTER:
             status = f"unreachable for {dur(min(b['beacon_age'] for b in heard))}"
             ok = False
         else:

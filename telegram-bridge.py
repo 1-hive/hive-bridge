@@ -720,6 +720,14 @@ def push_status(st: dict) -> None:
     msgs = st.setdefault("status_msg", {})
     for c in chats:
         cur = msgs.get(str(c["chat_id"]))
+        if cur and cur.get("pinned") is not True and time.time() - cur.get("pin_tried", 0) > 600:
+            # posted when the bot couldn't pin (a group upgraded to a supergroup drops its rights), or before this was
+            # recorded: retry
+            cur["pin_tried"] = time.time()
+            if safe("pinChatMessage", chat_id=c["chat_id"], message_id=cur["message_id"], disable_notification=True) is not None:
+                cur["pinned"] = True
+                log(f"status in {c['name']}: pinned")
+            save_state(st)
         if cur and cur.get("text") == text:
             continue
         if cur:
@@ -742,12 +750,12 @@ def push_status(st: dict) -> None:
         except RuntimeError as e:
             log(f"status in {c['name']}: {e}")
             continue
-        msgs[str(c["chat_id"])] = {"message_id": m["message_id"], "text": text}
+        pinned = safe("pinChatMessage", chat_id=c["chat_id"], message_id=m["message_id"], disable_notification=True) is not None
+        msgs[str(c["chat_id"])] = {"message_id": m["message_id"], "text": text, "pinned": pinned, "pin_tried": time.time()}
         save_state(st)
-        if safe("pinChatMessage", chat_id=c["chat_id"], message_id=m["message_id"], disable_notification=True) is None:
-            log(f"status in {c['name']}: posted, but not pinned (make the bot an admin that may pin, or pin it by hand)")
-        else:
-            log(f"status in {c['name']}: posted and pinned")
+        log(f"status in {c['name']}: posted and pinned" if pinned else
+            f"status in {c['name']}: posted, but not pinned (make the bot an admin that may pin, or pin it by hand; "
+            "it retries every 10 min)")
 
 
 def set_menu_button() -> None:

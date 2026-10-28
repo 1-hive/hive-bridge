@@ -106,6 +106,18 @@ def main():
     # 2. with groups
     b, sent, work = load(groups=True)
     st = {"offset": 0, "notified": [], "pending_reason": {}}
+    # another operator's private chat (Ben): /start gets help there; text goes to the chief of staff, answered there
+    sent.clear()
+    b.on_message(msg(BEN, "private", BEN, "/start", 5), st, "COS")
+    check("another operator's /start: help in their own chat", b.CHAT.empty() and sent and sent[-1][1]["chat_id"] == BEN
+          and "/floor" in sent[-1][1]["text"], sent)
+    b.on_message(msg(BEN, "private", BEN, "what is protocosmo2 doing?", 6), st, "COS")
+    _, text, human, target = b.CHAT.get(timeout=5); b.CHAT.task_done()
+    check("another operator's text: to the chief of staff, saying who, answered in their chat",
+          "from ben" in text and text.endswith("what is protocosmo2 doing?") and human and target == {"chat_id": BEN, "reply_to": 6},
+          (text, target))
+    b.on_message(msg(STRANGER, "private", STRANGER, "hi", 7), st, "COS")
+    check("a stranger's private chat is still ignored", b.CHAT.empty())
     bot_answer = msg(GROUP, "group", BOT1, "Here is my journal fix.", 10, is_bot=True)
     b.on_message(bot_answer, st, "COS")
     check("a bot's message is context only", b.CHAT.empty())

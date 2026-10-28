@@ -612,6 +612,9 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0] in ("/floor", "/start floor", "/board"):
         private_floor(chat["id"], frm["id"], text)
         return
+    if chat.get("type") == "private" and chat.get("id") != ALLOW["chat_id"] and is_operator(frm.get("id")):
+        other_operator(m, frm, chat, text, chat_cmd)
+        return
     if not allowed(frm, chat):
         log(f"ignored message from {frm.get('id')} in {chat.get('type')} {chat.get('id')} {chat.get('title')!r}")
         return
@@ -645,6 +648,25 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
+
+
+def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | None) -> None:
+    """Another operator's private chat (telegram-groups.json humans with the operator permission, e.g. Ben): help, and
+    the chief of staff, whose reply comes back here. The buttons, inbox and digest stay in telegram.json's chat."""
+    who = (HUMANS.get(frm.get("id")) or {}).get("name") or frm.get("first_name") or str(frm.get("id"))
+    if text.split("@")[0] in ("/start", "/help") or not text:
+        safe("sendMessage", chat_id=chat["id"], text=f"{hp.HIVE_ID}: write here to talk to the chief of staff, the "
+             "hive's coordinator; it answers in this chat. /floor opens the Floor (what each agent is doing now, what "
+             "it owes, and what needs you); /board shows the same in a message.")
+        return
+    if not chat_cmd:
+        safe("sendMessage", chat_id=chat["id"], text="Chat with the chief of staff isn't connected; /floor and /board work.")
+        return
+    if CHAT.unfinished_tasks:
+        safe("sendMessage", chat_id=chat["id"], text="(queued: the chief of staff is on another message)")
+    CHAT.put((chat_cmd, f"A private message to you from {who}, an operator of the hive. Your reply goes back to "
+              f"{who} in that private chat.\n\n{text}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
+    log(f"private message from operator {who} to the chief of staff")
 
 
 FLOOR = os.environ.get("FLOOR_URL", "http://127.0.0.1:8476")

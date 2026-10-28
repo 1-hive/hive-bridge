@@ -67,13 +67,13 @@ class Facts:
 
     def __init__(self, *, state: dict, events: list[dict], beacons: dict, samples: dict, dialogue: list[dict],
                  groups: dict, conf: dict, floor_up: list[float], cos: dict | None = None,
-                 merged: dict | None = None, merge_into: dict | None = None, requests: list[str] | None = None, now: float | None = None):
+                 merged: dict | None = None, merge_into: dict | None = None, requests: list[dict] | None = None, now: float | None = None):
         self.state, self.events, self.beacons, self.samples = state, events, beacons, samples
         self.dialogue, self.groups, self.conf, self.floor_up = dialogue, groups, conf, floor_up
         self.cos = cos or {}
         self.merged = merged or {}           # task -> False when its reviewed code isn't on its branch yet
-        self.merge_into = merge_into or {}   # task -> that branch (main, or an agent's own line such as protomega)
-        self.requests = requests or []       # the chief of staff's open requests to the operators (hive-requests/)
+        self.merge_into = merge_into or {}   # task -> {into: that branch (main, or a line such as protomega), repo, branch, url}
+        self.requests = requests or []       # the chief of staff's open requests to the operators: {name, text}
         self.now = now or time.time()
         self.chats = {c["chat_id"]: c for c in groups.get("chats", [])}
         self.humans = {h["user_id"]: h for h in groups.get("humans", [])}
@@ -209,7 +209,7 @@ def plate(f: Facts, actor: str, cls: str) -> list[dict]:
                     sub += f"; {f.name(rv)} can't run"
                 out.append({"stage": "In review", "task": t["id"], "sub": sub})
             elif st == "done" and f.merged.get(t["id"]) is False:
-                out.append({"stage": "Merge", "task": t["id"], "sub": f"review passed; its code isn't on {f.merge_into.get(t['id']) or 'main'} yet"})
+                out.append({"stage": "Merge", "task": t["id"], "sub": f"review passed; its code isn't on {(f.merge_into.get(t['id']) or {}).get('into') or 'main'} yet"})
         elif cls == "reviewer" and t.get("assigned_reviewer") == actor and st == "in_review":
             cr = t.get("current_result") or {}
             lr = t.get("latest_review") or {}
@@ -529,7 +529,9 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
     out = []
     for i in inbox:
         out.append({"tone": "bad" if "escalation" in i["kind"] else "warn", "title": i.get("title") or i["kind"],
-                    "text": i["kind"].replace("_", " ") + f" · {i['entity']} {i['id']}", "who": "operators"})
+                    "text": i["kind"].replace("_", " ") + f" · {i['entity']} {i['id']}",
+                    "steps": [f"Tell the chief of staff in the Work group what to do about {i['id']}; it records "
+                              "your decision and this goes away"], "who": "operators"})
     for i in cos_inbox:
         if i["kind"] != "task_blocked_unanswered_any":
             continue
@@ -540,7 +542,8 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
             continue
         out.append({"tone": "warn", "title": f"{f.name(t.get('owner'))} asks: {first_line(b.get('reason', ''), 100)}",
                     "text": f"needs {b.get('needs')} on {i['id']}; unanswered for {dur(f.now - since) if since else '?'}",
-                    "who": "operators"})
+                    "steps": [f"Answer in the Work group, naming {i['id']}: the chief of staff records your answer "
+                              f"and {f.name(t.get('owner'))} carries on"], "who": "operators"})
     for b in roster:
         if b["class"] != "reviewer" or not b["plate"] or b["now"]["state"] not in ("cantrun", "offline", "nodata"):
             continue
@@ -558,13 +561,29 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
     for tid, merged in f.merged.items():
         if merged is False:
             t = f.state["tasks"][tid]
-            out.append({"tone": "ok", "title": f"Merge {tid}", "text": f"{f.name(t.get('owner'))}'s code passed review; "
-                        f"its branch hive/{tid} isn't on {f.merge_into.get(tid) or 'main'} yet: open and merge the pull request (a merge commit), "
-                        "or delete the branch if it shouldn't be merged", "who": "operators"})
-    for name in f.requests:
-        out.append({"tone": "warn", "title": f"Request from the chief of staff: {name.replace('-', ' ')}",
-                    "text": f"hive-requests/{name}.md in the workspace; move it to hive-requests/done/ once handled",
-                    "who": "operators"})
+            m = f.merge_into.get(tid) or {}
+            into, branch, repo = m.get("into") or "main", m.get("branch") or f"hive/{tid}", m.get("repo") or "its repository"
+            steps = [f"Open the pull request ({branch} → {into}) and look over the change" if m.get("url") else
+                     f"In {repo}, open a pull request from {branch} into {into} and look over the change",
+                     "Merge it with a merge commit (not squash or rebase): the Floor sees the merge within 5 minutes",
+                     f"Shouldn't go in? Delete the branch {branch} instead; that clears this too"]
+            out.append({"tone": "ok", "title": f"Merge {f.name(t.get('owner'))}'s {repo} change into {into}",
+                        "text": f"{first_line(t.get('title') or tid, 120)} ({tid}): Astra passed it; it isn't on {into} yet.",
+                        "steps": steps, "link": {"label": "Open the pull request", "url": m["url"]} if m.get("url") else None,
+                        "who": "operators"})
+    for r in f.requests:
+        name, body = r["name"], r.get("text") or ""
+        lines = [l.strip() for l in body.splitlines()]
+        head = next((l.lstrip("# ").strip() for l in lines if l.startswith("#")), "") or name.replace("-", " ")
+        head = re.sub(r"^Request:\s*", "", head)
+        rest = [l for l in lines if l and not l.startswith("#") and not l.lower().startswith("from:")]
+        out.append({"tone": "warn", "title": f"The chief of staff asks: {first_line(head, 110)}",
+                    "text": first_line(" ".join(rest), 260),
+                    "steps": ["Read the request (below) and do what it asks, or decide it isn't needed",
+                              f"Then tell the chief of staff in the Work group: “request {name} is handled” (or why "
+                              "it won't be); it closes the request and this goes away"],
+                    "detail": body, "who": "operators"})
+    return out
     return out
 
 

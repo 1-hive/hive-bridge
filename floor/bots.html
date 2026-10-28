@@ -54,6 +54,13 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 .need.bad { border-color: rgba(255,125,107,.45); } .need.warn { border-color: rgba(242,181,61,.45); } .need.ok { border-color: rgba(127,211,160,.4); }
 .need b { display: block; font-weight: 600; font-size: 15px; }
 .need .txt { color: var(--muted); font-size: 13.5px; }
+.need .steps { margin: 8px 0 0; padding-left: 20px; font-size: 13.5px; line-height: 1.45; }
+.need .steps li { margin: 2px 0; }
+.need .go { display: inline-block; margin-top: 9px; padding: 5px 11px; border-radius: 9px; border: 1px solid var(--line); color: inherit; font-size: 13px; font-weight: 600; text-decoration: none; }
+.need .go:hover { border-color: currentColor; }
+.need details { margin-top: 8px; font-size: 13px; }
+.need summary { cursor: pointer; color: var(--muted); }
+.need pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono, monospace); font-size: 12px; max-height: 320px; overflow: auto; margin: 6px 0 0; }
 .calm { color: var(--muted); font-size: 14px; }
 .roster { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .card { text-align: left; font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px 18px 16px; display: flex; flex-direction: column; gap: 13px; cursor: pointer; min-width: 0; transition: border-color .15s, box-shadow .15s; }
@@ -209,6 +216,9 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 const TG = window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData ? window.Telegram.WebApp : null;
 if (TG) { TG.ready(); TG.expand(); try { TG.setHeaderColor("#11131a"); TG.setBackgroundColor("#11131a"); } catch (e) {} }
 const $ = id => document.getElementById(id);
+const needMore = n => (n.steps && n.steps.length ? `<ol class="steps">${n.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>` : "")
+  + (n.link && /^https:\/\//.test(n.link.url) ? `<a class="go" href="${esc(n.link.url)}" target="_blank" rel="noopener">${esc(n.link.label)} ↗</a>` : "")
+  + (n.detail ? `<details><summary>Read the request</summary><pre>${esc(n.detail)}</pre></details>` : "");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const hm = t => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false});
 const dur = s => { s = Math.max(0, Math.round(s)); if (s < 60) return `${s}s`; const m = Math.floor(s / 60); if (m < 60) return `${m}m`; const h = Math.floor(m / 60); return h < 48 ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${Math.floor(h / 24)}d ${h % 24}h`; };
@@ -294,7 +304,7 @@ function render() {
   $("head").textContent = "@" + d.head;
   $("clock").textContent = new Date(d.now * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false});
   $("machines").innerHTML = d.machines.map(m => `<span class="machine"><span class="dot small" style="color:${m.ok === false ? "var(--bad)" : m.ok ? "var(--ok)" : "var(--faint)"}"></span><b>${esc(m.name)}</b><span style="color:var(--muted)">${esc(m.status)}</span><span style="color:var(--faint)">${esc(m.runs.join(", "))}</span></span>`).join("");
-  $("needs").innerHTML = d.needs.length ? d.needs.map(n => `<div class="need ${esc(n.tone)}"><span class="dot k-${n.tone === "bad" ? "bad" : n.tone === "ok" ? "chat" : "task"}" style="${n.tone === "ok" ? "color:var(--ok)" : ""}"></span><div style="flex:1;min-width:0"><b>${esc(n.title)}</b><span class="txt">${esc(n.text)}</span></div></div>`).join("")
+  $("needs").innerHTML = d.needs.length ? d.needs.map(n => `<div class="need ${esc(n.tone)}"><span class="dot k-${n.tone === "bad" ? "bad" : n.tone === "ok" ? "chat" : "task"}" style="${n.tone === "ok" ? "color:var(--ok)" : ""}"></span><div style="flex:1;min-width:0"><b>${esc(n.title)}</b><span class="txt">${esc(n.text)}</span>${needMore(n)}</div></div>`).join("")
     : `<span class="calm">Nothing. The hive is working.</span>`;
   if (!SEL || !d.bots.some(b => b.id === SEL)) SEL = (d.bots.find(b => b.now.active) || d.bots[0] || {}).id;
   $("roster").innerHTML = d.bots.map(card).join("");

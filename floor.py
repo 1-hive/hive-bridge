@@ -354,11 +354,35 @@ def cos_turns() -> dict:
 
 # --- merged or not: a reviewed commit on its repository's default branch -------------------------
 
-_merged: dict = {}   # task -> (checked at, True/False/None, the branch it merges into)
+_merged: dict = {}   # task -> (checked at, True/False/None, its merge_info when there's a merge to do)
 MERGE_TTL = int(os.environ.get("FLOOR_MERGE_TTL", 300))   # seconds a merge verdict is reused
 
 
-MERGE_INTO: dict = {}   # task -> the branch its reviewed code merges into (main, protomega...)
+MERGE_INTO: dict = {}   # task -> {"into": its target branch, "repo", "branch": the hive/<task>... branch, "url": where to merge}
+
+
+def home_url(repo: str) -> str | None:
+    """The repository's GitHub page, from the registry's fetch URLs (the hive copy comes first; its home after)."""
+    try:
+        r = json.loads(Path(os.environ["HIVEPIN_REPOSITORY_REGISTRY_PATH"]).read_text())["repositories"][repo]
+    except (KeyError, OSError, ValueError, TypeError):
+        return None
+    for u in r.get("fetch_urls") or []:
+        m = re.match(r"(?:https://|git@)github\.com[/:]([^/]+)/(.+?)(?:\.git)?/?$", u)
+        if m:
+            return f"https://github.com/{m.group(1)}/{m.group(2)}"
+    return None
+
+
+def merge_info(clone: Path, repo: str, tid: str, sha: str, into: str, env: dict) -> dict:
+    """Where an operator merges a reviewed result: its branch (hive/<task>, or -r2... when the publisher had to publish
+    beside a taken one) and the GitHub page that opens its pull request (or shows the open one)."""
+    r = subprocess.run(["git", "-C", str(clone), "for-each-ref", "--contains", sha, "--format=%(refname:short)",
+                        f"refs/heads/hive/{tid}", f"refs/heads/hive/{tid}-r*"], capture_output=True, text=True, env=env)
+    branch = (r.stdout.split() or [f"hive/{tid}"])[0]
+    home = home_url(repo)
+    return {"into": into, "repo": repo, "branch": branch,
+            "url": f"{home}/compare/{into}...{branch}?expand=1" if home else None}
 
 
 def target_branch(clone: Path, base: str | None, env: dict) -> str:
@@ -403,7 +427,7 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
                 out[t["id"]] = hit[1]
                 MERGE_INTO[t["id"]] = hit[2]
             continue
-        verdict, into = True, None
+        verdict, info = True, None
         for pin in code:
             repo, sha = pin.get("repository"), pin.get("commit_oid", "").split(":")[-1]
             clone = Path(clones) / repo
@@ -411,9 +435,10 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
                 verdict = None
                 break
             env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
-            ref = into = target_branch(clone, bases.get(repo), env)
+            ref = target_branch(clone, bases.get(repo), env)
             r = subprocess.run(["git", "-C", str(clone), "merge-base", "--is-ancestor", sha, ref], capture_output=True, env=env)
             if r.returncode == 1:
+                info = merge_info(clone, repo, t["id"], sha, ref, env)
                 # not on main: still waiting for a merge, unless its task branch is gone from the remote
                 # (people decided not to merge it and deleted the branch: nothing left to do)
                 br = f"refs/heads/hive/{t['id']}"
@@ -423,10 +448,10 @@ def merged_map(st: dict, evs: list[dict]) -> dict:
             elif r.returncode != 0:
                 verdict = None
                 break
-        _merged[t["id"]] = (time.time(), verdict, into)
+        _merged[t["id"]] = (time.time(), verdict, info)
         if verdict is not None:
             out[t["id"]] = verdict
-            MERGE_INTO[t["id"]] = into
+            MERGE_INTO[t["id"]] = info
     return out
 
 
@@ -443,13 +468,19 @@ def facts() -> fb.Facts:
                     requests=open_requests())
 
 
-def open_requests() -> list[str]:
+def open_requests() -> list[dict]:
     """The chief of staff's requests to the operators: hive-requests/*.md on the workspace's main, not yet
-    moved into hive-requests/done/ (as the bridge's digest lists them)."""
+    moved into a subfolder (done/, closed/), as the bridge's digest lists them; each with its text."""
+    env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
     r = subprocess.run(["git", "-C", str(hp.WORKSPACE_REPO), "ls-tree", "--name-only", "main", "hive-requests/"],
-                       capture_output=True, text=True,
-                       env={**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"})
-    return [Path(x).stem for x in r.stdout.split() if x.endswith(".md")] if r.returncode == 0 else []
+                       capture_output=True, text=True, env=env)
+    out = []
+    for x in r.stdout.split() if r.returncode == 0 else []:
+        if x.endswith(".md"):
+            body = subprocess.run(["git", "-C", str(hp.WORKSPACE_REPO), "show", f"main:{x}"],
+                                  capture_output=True, text=True, env=env).stdout
+            out.append({"name": Path(x).stem, "text": body[:6000]})
+    return out
 
 
 def roster(f: fb.Facts) -> list[dict]:

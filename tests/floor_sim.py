@@ -330,15 +330,19 @@ def main():
         code, needs = get(fbase, "/api/needs")
         print("needs:", [n["title"] for n in needs["needs"]])
         assert any("Astra" in n["title"] for n in needs["needs"])
-        assert any("tidy-tests" in n["title"] or "merge" in n["title"].lower() for n in needs["needs"]), needs
+        mg = next(n for n in needs["needs"] if n["title"].startswith("Merge ")), needs
+        assert "tidy-tests" in mg[0]["text"] and "Tidy the tests" in mg[0]["text"] and len(mg[0]["steps"]) == 3, mg
+        assert "hive/tidy-tests" in mg[0]["steps"][0] and "into main" in mg[0]["title"], mg
         # a request from the chief of staff to the operators shows; a branch deleted on purpose is no longer a merge to do
         commit("workspace", "hive-requests/more-memory-for-vm2.md", "# More memory\n", "request")
         sh("git", "--git-dir", str(tmp / "hive-appliance.git"), "branch", "-D", "hive/tidy-tests")
         code, needs = get(fbase, "/api/needs")
         titles = [n["title"] for n in needs["needs"]]
         print("needs after:", titles)
-        assert "Request from the chief of staff: more memory for vm2" in titles, titles
-        assert not any("tidy-tests" in t for t in titles), "a deleted branch isn't a merge to do"
+        assert "The chief of staff asks: More memory" in titles, titles
+        req = next(n for n in needs["needs"] if n["title"].startswith("The chief of staff asks"))
+        assert "more-memory-for-vm2 is handled" in req["steps"][-1] and req["detail"].startswith("# More memory"), req
+        assert not any(n["title"].startswith("Merge ") for n in needs["needs"]), "a deleted branch isn't a merge to do"
         code, w = get(fbase, "/api/work")
         print("work:", [(s["name"], [i["id"] for i in s["items"]]) for s in w["stages"]])
         code, chats = get(fbase, "/api/chats")

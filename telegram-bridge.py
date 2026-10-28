@@ -595,6 +595,15 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
 
 
 def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
+    if m.get("migrate_to_chat_id") and (m.get("chat") or {}).get("id") in CHATS:
+        # Telegram turned a configured group into a supergroup (e.g. a setting changed): it has a new id, and
+        # until telegram-groups.json names it, every message there is ignored
+        old, new = m["chat"]["id"], m["migrate_to_chat_id"]
+        log(f"group {old} ({CHATS[old].get('name')}) became supergroup {new}: put {new} in telegram-groups.json")
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"⚠️ Telegram upgraded the {CHATS[old].get('name')} group to a "
+             f"supergroup with a new id, {new}. The bridge ignores it until telegram-groups.json has chat_id {new} "
+             f"in place of {old} (then restart hive-telegram).")
+        return
     if (m.get("chat") or {}).get("type") in ("group", "supergroup") and (m["chat"]["id"] in CHATS or m["chat"]["id"] == ALLOW["chat_id"]):
         on_group_message(m, st, chat_cmd)
         return
@@ -604,7 +613,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         private_floor(chat["id"], frm["id"], text)
         return
     if not allowed(frm, chat):
-        log(f"ignored message from {frm.get('id')}")
+        log(f"ignored message from {frm.get('id')} in {chat.get('type')} {chat.get('id')} {chat.get('title')!r}")
         return
     reply_to = str((m.get("reply_to_message") or {}).get("message_id", ""))
     if reply_to in st["pending_reason"]:

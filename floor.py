@@ -210,6 +210,54 @@ def keep_log() -> None:
         time.sleep(60)
 
 
+# --- problems reported in beacons reach the operators -------------------------------------------
+
+ALERT_AFTER = 600          # seconds a problem must last before the operators are told (main: --alert-after)
+CLEAR_AFTER = 120          # seconds without one before a reported problem counts as recovered
+PROBLEMS: dict[str, dict] = {}   # actor -> {"since", "text", "alerted"}
+
+
+def say(text: str) -> None:
+    """One message to the operators' chat (the bridge's bot and chat, as telegram-say.py), off the request thread."""
+    def send():
+        try:
+            import urllib.parse
+            import urllib.request
+            token = (CFG / "telegram-token").read_text().strip()
+            chat = json.loads((CFG / "telegram.json").read_text())["chat_id"]
+            data = urllib.parse.urlencode({"chat_id": chat, "text": text[:4000]}).encode()
+            urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=30).read()
+        except Exception as e:
+            print(f"floor alert not sent: {e}", flush=True)
+    threading.Thread(target=send, daemon=True).start()
+
+
+def watch_problem(actor: str, body: dict, t: float) -> str | None:
+    """An agent whose beacons report a problem for ALERT_AFTER seconds is reported once, and again when its beacons
+    stop reporting one. The problem's wording may change meanwhile (a reviewer's error names each task it tries),
+    so it counts as one problem until it clears. Returns the message to send, if any."""
+    problem = (body.get("problem") or "").strip()
+    p = PROBLEMS.get(actor)
+    if problem:
+        if p is None:
+            PROBLEMS[actor] = p = {"since": t, "text": problem, "alerted": False}
+        p["text"] = problem
+        p.pop("clear", None)
+        if not p["alerted"] and t - p["since"] >= ALERT_AFTER:
+            p["alerted"] = True
+            what = "reviewer" if body.get("kind") == "reviewer" else "agent"
+            return (f"⚠️ {actor} ({what}) has reported a problem for {int((t - p['since']) // 60)} min: {problem[:300]}"
+                    + ("\nIts reviews aren't being recorded until this is fixed." if what == "reviewer" else ""))
+        return None
+    if p is not None:
+        if p["alerted"] and t - p.setdefault("clear", t) < CLEAR_AFTER:
+            return None              # a restart clears the problem for a moment: recovered only if it stays clear
+        PROBLEMS.pop(actor)
+        if p["alerted"]:
+            return f"✅ {actor} recovered: its beacons report no problem now (it had one for {int((t - p['since']) // 60)} min)."
+    return None
+
+
 def take_beacon(headers, raw: bytes) -> tuple[int, str]:
     """Accept a beacon signed by an active actor's key, about that actor (hive-runtime's protocol)."""
     if len(raw) > 128_000:
@@ -237,6 +285,9 @@ def take_beacon(headers, raw: bytes) -> tuple[int, str]:
     t = time.time()
     with LOCK:
         BEACONS[actor] = {"body": body, "received": t}
+        alert = watch_problem(actor, body, t)
+        if alert:
+            say(alert)
         s = sample(body, t)
         SAMPLES.setdefault(actor, []).append(s)
         if len(SAMPLES[actor]) > 4000:
@@ -714,10 +765,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global ALERT_AFTER
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", type=int, default=8476)
     ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--alert-after", type=int, default=ALERT_AFTER,
+                    help="seconds an agent's beacons must report a problem before the operators are told (default 600)")
     a = ap.parse_args()
+    ALERT_AFTER = a.alert_after
     client.health()
     load_samples()
     threading.Thread(target=keep_log, daemon=True).start()

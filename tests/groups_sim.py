@@ -184,10 +184,38 @@ def main():
           and docs[0][0] == "sendDocument" and docs[0][1].startswith("# The summary") and docs[0][2]["reply_to_message_id"] == 12
           and docs[0][2]["chat_id"] == GROUP and "app abcdef1234 (branch hive/t9)" in docs[0][2]["caption"], docs)
     lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
-    check("t9's progress is threaded on its origin message", lines == [
-        (GROUP, 12, "t9: started"), (GROUP, 12, "t9: result posted, waiting for review"),
-        (GROUP, 12, "t9: review passed (worker.bot1)"), (GROUP, 12, "t9: done ✅")], lines)
-    check("t9's origin is dropped once done", "t9" not in b.load_origins(), b.load_origins())
+    edits = [(p["chat_id"], p["message_id"], p["text"]) for meth, p in sent if meth == "editMessageText"]
+    sid = b.load_origins()["t9"]["status_id"]
+    check("t9's progress is one status message on its origin message (all of it seen in one poll: no edits)",
+          lines == [(GROUP, 12, "t9: started → review 1 passed → done ✅")] and not edits and sid == 9000 + 1, (lines, edits, sid))
+    check("t9's origin is kept once done, for its PR link", b.load_origins()["t9"].get("closed"), b.load_origins())
+    # more review rounds, a question, and a posted result shown only while it waits
+    steps = [["task.accepted", "started"], ["task.result_posted", "result posted, waiting for review"],
+             ["review.recorded", "review 1 failed"], ["task.result_posted", "result posted, waiting for review"]]
+    check("a posted result shows only while it waits", b.status_text("t", steps)
+          == "t: started → review 1 failed → result posted, waiting for review", b.status_text("t", steps))
+    o = b.load_origins()
+    o["tq"] = {"chat_id": GROUP, "message_id": 13, "status_id": 9500, "steps": [["task.accepted", "started"]]}
+    b.save_origins(o)
+    qevs = [{"position": 56, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
+             "data": {"needs": "operator", "reason": "which branch?"}},
+            {"position": 57, "type": "review.recorded", "task": "tq", "actor": {"id": "worker.bot1"}, "data": {"verdict": "failed"}},
+            {"position": 58, "type": "review.recorded", "task": "tq", "actor": {"id": "worker.bot1"}, "data": {"verdict": "passed"}}]
+    st["origin_pos"] = 55
+    b.hive = lambda *a: (True, "\n".join(json.dumps(e) for e in qevs)) if a[0] == "events" else (True, "{}")
+    sent.clear()
+    b.push_origins(st)
+    lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    edits = [p["text"] for meth, p in sent if meth == "editMessageText"]
+    check("a question is a message of its own, on the status message", lines == [(9500, "tq: has a question (operator): which branch?")], lines)
+    check("later steps edit the status message, review rounds numbered", len(edits) == 2 and edits[-1]
+          == "tq: started → has a question (operator): which branch? → review 1 failed → review 2 passed", edits)
+    o = b.load_origins()
+    o["t9"]["closed"] -= 8 * 86400
+    b.save_origins(o)
+    b.hive = lambda *a: (True, "") if a[0] == "events" else (True, "{}")
+    b.push_origins(st)
+    check("a done task's origin is forgotten after a week", "t9" not in b.load_origins(), b.load_origins())
     # a task a bot proposed from a chat message (proposal.submitted with cause telegram:<chat>/<msg>): threaded there
     pevs = [{"position": 60, "type": "proposal.submitted", "actor": {"id": "worker.bot1"}, "cause": {"external": f"telegram:{GROUP}/77"},
              "data": {"proposal_id": "pp1", "approver_class": "chief_of_staff", "proposed": {"data": {"title": "Summarize X"}}}},
@@ -218,7 +246,7 @@ def main():
     sent.clear(); docs.clear()
     b.push_origins(st)
     lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
-    check("a task filed citing a chat message is threaded there", lines[:1] == [(DM, 33, "t11: started")], lines)
+    check("a task filed citing a chat message is threaded there", lines[:1] == [(DM, 33, "t11: started → done ✅")], lines)
     wg = next(c["chat_id"] for c in b.CHATS.values() if c.get("mode", "all") == "all" and not c.get("private"))
     check("a result its origin chat can't take goes to the work group", len(docs) == 1 and docs[0][2]["chat_id"] == wg
           and f"asked in chat {DM}" in docs[0][2]["caption"], docs)

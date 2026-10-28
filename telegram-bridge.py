@@ -1054,19 +1054,40 @@ def take_task_lines(reply: str, origin: dict | None) -> str:
     return "\n".join(keep).strip()
 
 
-ORIGIN_NOTES = {   # record event -> the line posted on the task's origin message
+ORIGIN_NOTES = {   # record event -> its step in the task's status message on its origin message
     "task.accepted": lambda e, d: "started",
     "task.blocked": lambda e, d: f"has a question ({d.get('needs')}): {d.get('reason', '')}",
     "task.result_posted": lambda e, d: "result posted, waiting for review",
-    "review.recorded": lambda e, d: f"review {d.get('verdict')} ({e['actor']['id']})",
+    "review.recorded": lambda e, d: f"review {{n}} {d.get('verdict')}",
     "task.closed": lambda e, d: "done ✅",
     "task.cancelled": lambda e, d: f"cancelled: {d.get('reason', '')}",
 }
+ORIGIN_KEEP = 7 * 86400   # a done task's origin is kept this long, for its PR link (telegram-say.py with HIVE_TASK)
+
+
+def status_text(task: str, steps: list) -> str:
+    """One line for the task's status message: its steps so far, a posted result shown only while it waits."""
+    shown = [text for i, (kind, text) in enumerate(steps)
+             if kind != "task.result_posted" or i == len(steps) - 1]
+    return f"{task}: {' → '.join(shown)}"[:4000]
+
+
+def show_status(task: str, origin: dict) -> None:
+    """The task's one status message: posted on its origin message the first time, edited in place after."""
+    text = status_text(task, origin.get("steps") or [])
+    if origin.get("status_id"):
+        safe("editMessageText", chat_id=origin["chat_id"], message_id=origin["status_id"], text=text)
+        return
+    m = safe("sendMessage", chat_id=origin["chat_id"], text=text, reply_to_message_id=origin["message_id"],
+             allow_sending_without_reply=True)
+    if m and m.get("message_id"):
+        origin["status_id"] = m["message_id"]
 
 
 def push_origins(st: dict) -> None:
-    """Thread each chat-started task's progress on the message it came from."""
-    o = load_origins()
+    """Each chat-started task's progress, as one status message on the message it came from, edited as it moves;
+    a question and the result as messages of their own."""
+    o, touched = load_origins(), set()
     ok, out = hive("events", "--after", str(st.get("origin_pos", 0)))
     if not ok:
         return
@@ -1098,12 +1119,28 @@ def push_origins(st: dict) -> None:
         t, f = e.get("task"), ORIGIN_NOTES.get(e["type"])
         if not (t and f and t in o):
             continue
-        safe("sendMessage", chat_id=o[t]["chat_id"], text=f"{t}: {f(e, e.get('data') or {})}"[:1000],
-             reply_to_message_id=o[t]["message_id"], allow_sending_without_reply=True)
+        steps, d = o[t].setdefault("steps", []), e.get("data") or {}
+        text = f(e, d).replace("{n}", str(1 + sum(k == "review.recorded" for k, _ in steps)))
+        steps.append([e["type"], text])
+        touched.add(t)
+        if e["type"] == "task.blocked":   # a question needs someone: its own message, not only a step
+            show_status(t, o[t])
+            touched.discard(t)
+            safe("sendMessage", chat_id=o[t]["chat_id"], text=f"{t}: {text}"[:1000],
+                 reply_to_message_id=o[t].get("status_id") or o[t]["message_id"], allow_sending_without_reply=True)
         if e["type"] == "task.closed":
+            show_status(t, o[t])
+            touched.discard(t)
             send_result(t, o[t])
-        if e["type"] in ("task.closed", "task.cancelled"):
+            o[t]["closed"] = time.time()
+        if e["type"] == "task.cancelled":
+            show_status(t, o[t])
+            touched.discard(t)
             del o[t]
+    for t in touched:
+        show_status(t, o[t])
+    for t in [t for t, x in o.items() if time.time() - x.get("closed", time.time()) > ORIGIN_KEEP]:
+        del o[t]
     save_origins(o)
     save_state(st)
 

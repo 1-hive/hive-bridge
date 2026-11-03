@@ -1202,9 +1202,46 @@ def result_text(pin: dict) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
+SUMMARY_HEAD = re.compile(r"^(#{1,6})\s*summary\s*:?\s*$", re.I)
+SUMMARY_MAX, FALLBACK_CHARS = 3500, 800   # a Telegram message holds 4096 characters
+
+
+def cut(text: str, n: int) -> str:
+    """text, at most about n characters, ended at a paragraph, line or word break when one is near."""
+    if len(text) <= n:
+        return text
+    head = text[:n]
+    for brk in ("\n\n", "\n", " "):
+        i = head.rfind(brk)
+        if i > n // 2:
+            return head[:i].rstrip() + " …"
+    return head.rstrip() + "…"
+
+
+def report_summary(text: str) -> tuple[str, bool]:
+    """A result report's "## Summary" section (any heading level), up to the next heading at its level or
+    above, and True; a report without one gives its first ~800 characters and False."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = SUMMARY_HEAD.match(line.strip())
+        if not m:
+            continue
+        body = []
+        for nxt in lines[i + 1:]:
+            h = re.match(r"^(#{1,6})\s", nxt)
+            if h and len(h.group(1)) <= len(m.group(1)):
+                break
+            body.append(nxt)
+        found = "\n".join(body).strip()
+        if found:
+            return cut(found, SUMMARY_MAX), True
+    return cut(text.strip(), FALLBACK_CHARS), False
+
+
 def send_result(task: str, origin: dict) -> None:
-    """A chat-started task is done: its result report goes back to the message it came from, as a file to
-    download, with the code it changed named (repository, commit, the task's branch)."""
+    """A chat-started task is done: its result goes back to the message it came from as two messages, the
+    report's summary as text to read there, then the full report as a file to download, with the code it
+    changed named (repository, commit, the task's branch)."""
     ok, out = hive("task", task)
     if not ok:
         return
@@ -1222,19 +1259,25 @@ def send_result(task: str, origin: dict) -> None:
     f = STATE.parent / "results" / f"{task}.md"
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(text)
-    caption = f"{task}: the result" + (f"; code: {', '.join(code)}" if code else "")
+    summary, found = report_summary(text)
+    label = "Summary:" if found else "The report has no summary; it starts:"
+    caption = f"{task}: the full report" + (f"; code: {', '.join(code)}" if code else "")
+
+    def deliver(chat_id, reply_to, note=""):
+        reply = {"reply_to_message_id": reply_to, "allow_sending_without_reply": "true"} if reply_to else {}
+        tg("sendMessage", chat_id=chat_id, text=f"{task}: done{note}. {label}\n\n{summary}", disable_web_page_preview=True, **reply)
+        tg_file("sendDocument", "document", f, chat_id=chat_id, caption=f"{caption}{note}"[:1000], **reply)
+
     try:
-        tg_file("sendDocument", "document", f, chat_id=origin["chat_id"], caption=caption[:1000],
-                reply_to_message_id=origin["message_id"], allow_sending_without_reply="true")
-        log(f"result of {task} sent to {origin['chat_id']}")
+        deliver(origin["chat_id"], origin["message_id"])
+        log(f"result of {task} sent to {origin['chat_id']}" + ("" if found else " (no summary in the report)"))
     except Exception as ex:
         # the origin may be a chat this bot can't post in (a private chat with another bot): the work group gets it
         work = next((c for c in CHATS.values() if c.get("mode", "all") == "all" and not c.get("private")), None)
         log(f"result of {task}: {ex}" + (f"; sending it to {work['chat_id']}" if work else ""))
         if work and work["chat_id"] != origin["chat_id"]:
             try:
-                tg_file("sendDocument", "document", f, chat_id=work["chat_id"],
-                        caption=f"{caption} (asked in chat {origin['chat_id']}, which I can't post in)"[:1000])
+                deliver(work["chat_id"], None, f" (asked in chat {origin['chat_id']}, which I can't post in)")
             except Exception as ex2:
                 log(f"result of {task} to the work group: {ex2}")
 

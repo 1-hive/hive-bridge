@@ -179,7 +179,10 @@ def main():
     ws = Path(tempfile.mkdtemp())
     genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     subprocess.run(["git", "init", "-q", str(ws)], check=True)
-    (ws / "r.md").write_text("# The summary\n\nAll of it.\n")
+    (ws / "r.md").write_text("# Result of t9\n\nRevision 3; code refs below; review follow-ups addressed.\n\n"
+                             "## Summary\n\nYou asked which cache to use. Use Redis: it is twice as fast here.\n\n"
+                             "Open: who pays for the instance?\n\n## Evidence\n\nBenchmarks, logs.\n")
+    (ws / "r2.md").write_text("# Result of t11\n\n" + "Revision history and code refs. " * 60)
     subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(ws), "commit", "-qm", "r"], check=True, env=genv)
     head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -189,17 +192,24 @@ def main():
     b.hive = lambda *a: ((True, "\n".join(json.dumps(e) for e in evs)) if a[0] == "events"
                          else (True, json.dumps(t9)) if a[:2] == ("task", "t9") else (True, "{}"))
     docs = []
-    b.tg_file = lambda method, field, f, **p: docs.append((method, f.read_text(), p)) or {}
+    b.tg_file = lambda method, field, f, **p: docs.append((method, f.read_text(), p)) or sent.append((method, p)) or {}
     sent.clear()
     b.push_origins(st)
     check("t9's result goes back to its origin message as a file, naming its code", len(docs) == 1
-          and docs[0][0] == "sendDocument" and docs[0][1].startswith("# The summary") and docs[0][2]["reply_to_message_id"] == 12
+          and docs[0][0] == "sendDocument" and docs[0][1].startswith("# Result of t9") and docs[0][2]["reply_to_message_id"] == 12
           and docs[0][2]["chat_id"] == GROUP and "app abcdef1234 (branch hive/t9)" in docs[0][2]["caption"], docs)
     lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     edits = [(p["chat_id"], p["message_id"], p["text"]) for meth, p in sent if meth == "editMessageText"]
     sid = b.load_origins()["t9"]["status_id"]
     check("t9's progress is one status message on its origin message (all of it seen in one poll: no edits)",
-          lines == [(GROUP, 12, "t9: started → review 1 passed → done ✅")] and not edits and sid == 9000 + 1, (lines, edits, sid))
+          lines[:1] == [(GROUP, 12, "t9: started → review 1 passed → done ✅")] and not edits and sid == 9000 + 1, (lines, edits, sid))
+    order = [m for m, p in sent if p.get("reply_to_message_id") == 12]
+    check("t9's result: first its report's ## Summary as a message on the origin message, then the report file",
+          order == ["sendMessage", "sendMessage", "sendDocument"] and lines[1:] == [(GROUP, 12, "t9: done. Summary:\n\n"
+          "You asked which cache to use. Use Redis: it is twice as fast here.\n\nOpen: who pays for the instance?")], (order, lines))
+    s, found = b.report_summary("# R\n\n### Summary:\n\nShort.\n\n#### Detail\n\nkept\n\n## Next\n\ndropped\n")
+    check("a summary runs to the next heading at its level or above", found and s == "Short.\n\n#### Detail\n\nkept", s)
+    check("an empty summary section counts as none", b.report_summary("## Summary\n\n## Evidence\n\nx")[1] is False)
     check("t9's origin is kept once done, for its PR link", b.load_origins()["t9"].get("closed"), b.load_origins())
     # more review rounds, a question, and a posted result shown only while it waits
     steps = [["task.accepted", "started"], ["task.result_posted", "result posted, waiting for review"],
@@ -268,22 +278,32 @@ def main():
             {"position": 71, "type": "task.accepted", "task": "t11", "actor": {"id": "worker.bot1"}, "data": {}},
             {"position": 72, "type": "task.closed", "task": "t11", "actor": {"id": "cos"}, "data": {}}]
     st["origin_pos"] = 69
-    t11 = {"task": {"id": "t11", "current_result": {"event_id": "e9", "pin": {"repository": "workspace", "commit_oid": f"sha1:{head}", "path": "r.md"}}},
+    t11 = {"task": {"id": "t11", "current_result": {"event_id": "e9", "pin": {"repository": "workspace", "commit_oid": f"sha1:{head}", "path": "r2.md"}}},
            "events": []}
     b.hive = lambda *a: ((True, "\n".join(json.dumps(e) for e in revs)) if a[0] == "events"
                          else (True, json.dumps(t11)) if a[:2] == ("task", "t11") else (True, "{}"))
+    def tg_dm(method, **p):   # a private chat with another bot: Telegram refuses every message there but the status
+        if p["chat_id"] == DM and "done." in p.get("text", ""):
+            raise RuntimeError("Forbidden: bot can't initiate conversation with a user")
+        return keep[0](method, **p)
     def tg_file(method, field, f, **p):
         if p["chat_id"] == DM:
             raise RuntimeError("Forbidden: bot can't initiate conversation with a user")
         docs.append((method, f.read_text(), p))
-    b.tg_file = tg_file
+    keep = (b.tg, b.safe)
+    b.tg, b.tg_file = tg_dm, tg_file
     sent.clear(); docs.clear()
     b.push_origins(st)
-    lines = [(p["chat_id"], p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
+    lines = [(p["chat_id"], p.get("reply_to_message_id"), p["text"]) for meth, p in sent if meth == "sendMessage"]
     check("a task filed citing a chat message is threaded there", lines[:1] == [(DM, 33, "t11: started → done ✅")], lines)
     wg = next(c["chat_id"] for c in b.CHATS.values() if c.get("mode", "all") == "all" and not c.get("private"))
     check("a result its origin chat can't take goes to the work group", len(docs) == 1 and docs[0][2]["chat_id"] == wg
           and f"asked in chat {DM}" in docs[0][2]["caption"], docs)
+    fb = [t for c, r, t in lines if c == wg]
+    check("a report with no summary: its first ~800 characters instead, said so, to the work group too", len(fb) == 1
+          and fb[0].startswith(f"t11: done (asked in chat {DM}, which I can't post in). The report has no summary; it starts:\n\n# Result of t11")
+          and fb[0].endswith(" …") and len(fb[0]) < 950, fb)
+    b.tg = keep[0]
     ping = b.PINGS["proposal.submitted"][1]
     check("the chief of staff is woken for a proposal to it", "Summarize X" in (ping(pevs[0]) or "")
           and f"telegram:{GROUP}/77" in ping(pevs[0]), ping(pevs[0]))

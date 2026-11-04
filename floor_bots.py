@@ -705,4 +705,8 @@ def status(f: Facts, roster: list[dict], needs_: list[dict]) -> dict:
     if needs_:
         lines.append("👉 <b>For you:</b> " + e(" · ".join(n["title"] for n in needs_))[:900])
     lines.append(f"<i>{time.strftime('%H:%M', time.gmtime(f.now))} UTC · this message updates itself</i>")
-    return {"text": "\n".join(lines), "head": head, "at": f.now}
+    # the agents in trouble, for the bridge to tell the chief of staff (it can't see beacons)
+    trouble = [{"id": b["id"], "name": b["name"], "state": b["now"]["state"],
+                "detail": b["now"].get("detail") or b["now"].get("headline") or ""}
+               for b in roster if b["now"]["state"] in ("cantrun", "offline") and b["class"] != "chief_of_staff"]
+    return {"text": "\n".join(lines), "head": head, "at": f.now, "trouble": trouble}

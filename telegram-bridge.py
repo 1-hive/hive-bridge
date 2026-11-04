@@ -877,6 +877,39 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
+TROUBLE_AFTER = 600   # seconds an agent must stay offline or unable to run before the chief of staff is told
+
+
+def ping_cos_trouble(st: dict, chat_cmd: str) -> None:
+    """Tell the chief of staff when an agent has been offline or unable to run (the Floor, from its beacons) for
+    TROUBLE_AFTER seconds, once, and when it recovers: the record can't show either, so without this it learns of it
+    only when a human quotes the board."""
+    try:
+        now_bad = {b["id"]: b for b in floor_get("/api/status").get("trouble") or []}
+    except Exception:
+        return   # push_status logs a Floor that isn't answering
+    seen = st.setdefault("trouble", {})   # actor -> {"since", "told"}
+    t = time.time()
+    for a, b in now_bad.items():
+        p = seen.setdefault(a, {"since": t, "told": False})
+        if not p["told"] and t - p["since"] >= TROUBLE_AFTER:
+            p["told"] = True
+            word = "can't run" if b["state"] == "cantrun" else "is offline"
+            CHAT.put((chat_cmd, f"The Floor says {b['name']} ({a}) {word}, for {int((t - p['since']) // 60)} min now: "
+                                f"{b['detail'][:300]} This is from its runner's beacons, not the record. Read it with the "
+                                "floor tool, then handle it as your doc says (The Floor). Reply in one line with what you "
+                                "did, or what the operators must do.", False, None))
+            log(f"pinged cos: {a} {b['state']}")
+    for a in [a for a in seen if a not in now_bad]:
+        p = seen.pop(a)
+        if p["told"]:
+            CHAT.put((chat_cmd, f"The Floor says {a} recovered: it was in trouble for {int((t - p['since']) // 60)} min "
+                                "and its beacons report no problem now. If you told anyone it was down, tell them in one "
+                                "line; otherwise reply with nothing.", False, None))
+            log(f"pinged cos: {a} recovered")
+    save_state(st)
+
+
 FOLLOWUPS = hp.WORK_DIR / "cos" / "followups"
 FOLLOWUP_WINDOW_S, FOLLOWUP_AHEAD_S, FOLLOWUP_MAX = 16 * 60, 2 * 3600, 3
 
@@ -1387,6 +1420,8 @@ def main() -> None:
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)
+                    if BOARD_BOTS:
+                        ping_cos_trouble(st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every
             for u in tg("getUpdates", offset=st["offset"], timeout=a.poll, allowed_updates=["message", "callback_query"]):
                 st["offset"] = u["update_id"] + 1

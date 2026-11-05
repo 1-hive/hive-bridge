@@ -43,6 +43,10 @@ The digest lists results waiting more than an hour for a verdict, with what the 
 An over-budget alert carries a "+4h" button: it raises the goal's wall-clock budget
 to 4 hours from now (`op budget` does the same) and resolves the alert.
 
+New repositories (with HIVE_NEW_REPO_CMD): a chief-of-staff request with `kind: new-repository` is posted with
+Create / Decline buttons in the chat that asked (any operator may tap there); Create runs the command and
+records hive.registry_changed with the digest it prints. See "New repositories" below main's helpers.
+
 When a task is done (closed or cancelled), a one-line note is pushed, without buttons
 (`--no-feed` turns them off). A completed goal already arrives as an inbox item.
 
@@ -409,8 +413,147 @@ def allowed(frm: dict, chat: dict) -> bool:
     return chat.get("id") == ALLOW["chat_id"] and is_operator(frm.get("id"))
 
 
+# New repositories (hive-runtime new-repo.py): the chief of staff files a request whose front matter says
+# `kind: new-repository`; the bridge posts it with Create / Decline buttons as a reply to the message that asked
+# (or in the operator chat), and any human with the operator permission may tap. Create runs NEW_REPO_CMD NAME
+# DESCRIPTION (e.g. proto-hive's deploy/new-repo through one sudo rule), records hive.registry_changed with the
+# digest it prints (this bridge's operator key: the SPEC lets only an operator record it) and tells the chief of
+# staff. Off unless HIVE_NEW_REPO_CMD is set. Agents never hold the GitHub credential; a human decides each time.
+NEW_REPO_CMD = os.environ.get("HIVE_NEW_REPO_CMD", "")
+CHAT_CMD: str | None = None   # --chat-cmd, set in main()
+REPO_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+CAUSE_RE = re.compile(r"^telegram:(-?\d+)/(\d+)$")
+
+
+def front_matter(text: str) -> dict:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return out
+        k, sep, v = line.partition(":")
+        if sep:
+            out[k.strip().lower()] = v.strip().strip('"').strip("'")
+    return {}
+
+
+def repo_requests() -> list[dict]:
+    """Open new-repository requests on the workspace's main (hive-requests/*.md, not in a subfolder)."""
+    r = subprocess.run(["git", "-C", str(WORKSPACE), "ls-tree", "--name-only", "main", "hive-requests/"],
+                       capture_output=True, text=True)
+    out = []
+    for path in r.stdout.split() if r.returncode == 0 else []:
+        if not path.endswith(".md"):
+            continue
+        body = subprocess.run(["git", "-C", str(WORKSPACE), "show", f"main:{path}"], capture_output=True, text=True).stdout
+        fm = front_matter(body)
+        if fm.get("kind") != "new-repository" or not REPO_NAME.match(fm.get("name", "")):
+            continue
+        out.append({"key": hashlib.sha256(path.encode()).hexdigest()[:10], "path": path, "name": fm["name"],
+                    "description": fm.get("description", "")[:300], "asked_by": fm.get("asked_by", ""),
+                    "cause": fm.get("cause", "")})
+    return out
+
+
+def push_repo_requests(st: dict) -> None:
+    if not NEW_REPO_CMD:
+        return
+    seen = st.setdefault("repo_requests", {})
+    for q in repo_requests():
+        if q["key"] in seen:
+            continue
+        m = CAUSE_RE.match(q["cause"])
+        chat = int(m.group(1)) if m and int(m.group(1)) in CHATS else ALLOW["chat_id"]
+        reply = ({"reply_parameters": {"message_id": int(m.group(2)), "allow_sending_without_reply": True}}
+                 if m and chat != ALLOW["chat_id"] else {})
+        text = (f"🆕 <b>New repository: {esc(q['name'])}</b>" + (f"\n{esc(q['description'])}" if q["description"] else "")
+                + (f"\nAsked by {esc(q['asked_by'])}." if q["asked_by"] else "")
+                + "\n\nCreate makes it under the agents' GitHub account and registers it, so the agents can work in it "
+                  "and their work is reviewed before it reaches GitHub. An operator taps.")
+        kb = [[{"text": "✅ Create", "callback_data": f"newrepo:{q['key']}"},
+               {"text": "✖ Decline", "callback_data": f"norepo:{q['key']}"}]]
+        sent = safe("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup={"inline_keyboard": kb}, **reply)
+        if sent is None and reply:   # e.g. the origin message is gone: post without the reply
+            sent = safe("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup={"inline_keyboard": kb})
+        if sent is None:
+            log(f"couldn't post the new repository request {q['path']}")
+            continue
+        seen[q["key"]] = {**q, "state": "asked", "chat": chat, "message": sent["message_id"], "text": text}
+        save_state(st)
+        log(f"posted new repository request {q['name']} ({q['path']})")
+
+
+def create_repo(q: dict, who: str) -> tuple[bool, str]:
+    """Run NEW_REPO_CMD, then record the registry it made. (ok, a line for the chat)."""
+    try:
+        r = subprocess.run([*NEW_REPO_CMD.split(), q["name"], q["description"]], capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"couldn't run the new-repository command: {e}"
+    out = (r.stdout or "") + (r.stderr or "")
+    digest = next((x.split("=", 1)[1].strip() for x in reversed(out.splitlines()) if x.startswith("registry_digest=")), "")
+    url = next((x.split()[1] for x in out.splitlines() if x.startswith("ready: ")), "")
+    if r.returncode or not digest.startswith("sha256:"):
+        last = [x for x in out.splitlines() if x.strip()][-3:]
+        return False, "creating it failed: " + " / ".join(last)[-400:]
+    args = ["emit", "hive.registry_changed", "--data",
+            json.dumps({"registry_digest": digest, "reason": f"new repository {q['name'].lower()} ({who}, via telegram)"})]
+    if CAUSE_RE.match(q["cause"]):
+        args += ["--cause-external", q["cause"]]
+    ok, rec = hive(*args)
+    if not ok:
+        return False, (f"{url or q['name']} was created, but recording the registry failed, so every pin is refused "
+                       f"until an operator records {digest}: {rec.splitlines()[-1][:200] if rec else '?'}")
+    return True, f"{url} is ready and registered (position {json.loads(rec)['position']})"
+
+
+def on_repo_callback(cq: dict, st: dict, action: str, key: str) -> None:
+    frm, msg = cq.get("from") or {}, cq.get("message") or {}
+    q = st.setdefault("repo_requests", {}).get(key)
+    chat = (msg.get("chat") or {}).get("id")
+    if not q or chat != q["chat"] or msg.get("message_id") != q["message"]:
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown request")
+        return
+    if not is_operator(frm.get("id")):
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="only an operator can decide this")
+        log(f"refused new repository tap from {frm.get('id')}")
+        return
+    if q["state"] != "asked":
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="already decided")
+        return
+    who = sender_name(frm)
+    q["state"] = "creating" if action == "newrepo" else "declined"
+    save_state(st)
+    safe("answerCallbackQuery", callback_query_id=cq["id"], text="creating it…" if action == "newrepo" else "declined")
+    if action == "norepo":
+        line = f"✖ Declined by {who}."
+        cos = (f"{who} (operator) declined the new repository {q['name']} (request {q['path']}). Tell whoever asked, "
+               "and move the request to hive-requests/closed/. Reply in one line.")
+    else:
+        safe("editMessageText", chat_id=chat, message_id=q["message"], text=q["text"] + f"\n\n⏳ {esc(who)} tapped Create…",
+             parse_mode="HTML")
+        ok, info = create_repo(q, who)
+        q["state"] = "done" if ok else "failed"
+        line = f"{'✅' if ok else '❌'} {info} ({who})."
+        cos = (f"Operators: the new repository {q['name'].lower()} is ready and registered, staged ({info}; {who} tapped "
+               f"Create). Assign code work in it now (repos: [\"{q['name'].lower()}\"]); workers clone it from GitHub. "
+               f"Move the request {q['path']} to hive-requests/closed/ and tell whoever asked. Reply in one line."
+               if ok else
+               f"Creating the new repository {q['name']} failed ({who} tapped Create): {info}. Tell the operators what it "
+               "says; don't retry it yourself. Reply in one line.")
+        log(f"new repository {q['name']}: {info}")
+    save_state(st)
+    safe("editMessageText", chat_id=chat, message_id=q["message"], text=q["text"] + "\n\n" + esc(line), parse_mode="HTML")
+    if CHAT_CMD:
+        CHAT.put((CHAT_CMD, cos, False, None))
+
+
 def on_callback(cq: dict, st: dict) -> None:
     msg = cq.get("message") or {}
+    act, _, rest = (cq.get("data") or "").partition(":")
+    if act in ("newrepo", "norepo"):   # posted in group chats too: any operator may decide (on_repo_callback)
+        return on_repo_callback(cq, st, act, rest)
     if not allowed(cq.get("from") or {}, msg.get("chat") or {}):
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="not allowed")
         log(f"refused callback from {cq.get('from', {}).get('id')}")
@@ -1391,7 +1534,8 @@ def main() -> None:
     ap.add_argument("--chat-cmd", default=os.environ.get("TELEGRAM_CHAT_CMD") or None,
                     help="command that reads a message on stdin and prints the reply (default: $TELEGRAM_CHAT_CMD)")
     a = ap.parse_args()
-    global REMIND_S, DIGEST_AT
+    global REMIND_S, DIGEST_AT, CHAT_CMD
+    CHAT_CMD = a.chat_cmd
     REMIND_S = a.remind_hours * 3600
     DIGEST_AT = tuple(int(x) for x in a.digest_at.split(":"))
     st = load_state()
@@ -1417,6 +1561,7 @@ def main() -> None:
                 if CHATS:
                     push_origins(st)
                     push_status(st)
+                push_repo_requests(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)

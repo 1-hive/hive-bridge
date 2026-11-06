@@ -16,6 +16,8 @@ import html
 import re
 import time
 
+import card
+
 DAY = 24 * 3600
 OFFLINE_AFTER = 150          # seconds without a beacon (they come every 30 s)
 STEP_RECENT = 120            # a step this recent means the agent is working
@@ -68,13 +70,14 @@ class Facts:
     def __init__(self, *, state: dict, events: list[dict], beacons: dict, samples: dict, dialogue: list[dict],
                  groups: dict, conf: dict, floor_up: list[float], cos: dict | None = None,
                  merged: dict | None = None, merge_into: dict | None = None, requests: list[dict] | None = None, now: float | None = None,
-                 started: float = 0.0):
+                 started: float = 0.0, questions: dict | None = None):
         self.state, self.events, self.beacons, self.samples = state, events, beacons, samples
         self.dialogue, self.groups, self.conf, self.floor_up = dialogue, groups, conf, floor_up
         self.cos = cos or {}
         self.merged = merged or {}           # task -> False when its reviewed code isn't on its branch yet
         self.merge_into = merge_into or {}   # task -> {into: that branch (main, or a line such as protomega), repo, branch, url}
         self.requests = requests or []       # the chief of staff's open requests to the operators: {name, text}
+        self.questions = questions or {}     # blocked task -> its question file's text (decision card, if any)
         self.now = now or time.time()
         self.started = started               # when this Floor process started: a beacon isn't missing before it could arrive
         self.chats = {c["chat_id"]: c for c in groups.get("chats", [])}
@@ -531,6 +534,29 @@ def event_text(f: Facts, e: dict, actor: str) -> str:
 
 # --- the rest of the page --------------------------------------------------------------------------
 
+def card_head(c: dict) -> str:
+    """A decision card's one-line title: what waits on the answer, else the status."""
+    b = (c.get("before") or "").rstrip(":.")
+    return f"before {b[0].lower() + b[1:]}" if b and not b.lower().startswith("before") else (b or c.get("status") or "")
+
+
+def card_view(c: dict | None) -> dict | None:
+    """The card as the Floor shows it (card.py's fields; each question split into its text and answers)."""
+    if not c:
+        return None
+    qs = []
+    for q in c.get("questions") or []:
+        text, mark, rest = q.partition("?")
+        answers = [a.strip() for a in rest.split(" / ") if ":" in a] if mark else []
+        if mark and answers and len(answers) == len(rest.split(" / ")):
+            qs.append({"q": text.strip() + "?", "answers": [dict(zip(("word", "leads"), (x.strip() for x in a.split(":", 1))))
+                                                           for a in answers]})
+        else:
+            qs.append({"q": q, "answers": []})
+    return {"status": c.get("status") or "", "before": c.get("before") or "", "questions": qs,
+            "recommend": c.get("recommend") or "", "if_silent": c.get("if_silent") or ""}
+
+
 def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]) -> list[dict]:
     """What the humans should act on, by fixed rules."""
     out = []
@@ -547,10 +573,16 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         since = ts((next((e for e in reversed(f.by_task.get(i["id"], [])) if e["type"] == "task.blocked"), {}) or {}).get("recorded_at"))
         if since and f.now - since < 30 * 60:
             continue
-        out.append({"tone": "warn", "title": f"{f.name(t.get('owner'))} asks: {first_line(b.get('reason', ''), 100)}",
-                    "text": f"needs {b.get('needs')} on {i['id']}; unanswered for {dur(f.now - since) if since else '?'}",
-                    "steps": [f"Answer in the Work group, naming {i['id']}: the chief of staff records your answer "
-                              f"and {f.name(t.get('owner'))} carries on"], "who": "operators"})
+        c = card.parse(f.questions.get(i["id"]) or "")
+        waited = f"unanswered for {dur(f.now - since) if since else '?'}"
+        out.append({"tone": "warn", "title": f"{f.name(t.get('owner'))} asks: "
+                    + first_line(card_head(c) if c else b.get('reason', ''), 100),
+                    "text": f"needs {b.get('needs')} on {i['id']}; {waited}",
+                    "card": card_view(c),
+                    "steps": [("Tap an answer under the ❓ message in the Work group, or answer there naming "
+                               if c else "Answer in the Work group, naming ")
+                              + f"{i['id']}: the chief of staff records your answer and {f.name(t.get('owner'))} carries on"],
+                    "who": "operators"})
     for b in roster:
         if b["class"] != "reviewer" or not b["plate"] or b["now"]["state"] not in ("cantrun", "offline", "nodata"):
             continue
@@ -584,8 +616,10 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         head = next((l.lstrip("# ").strip() for l in lines if l.startswith("#")), "") or name.replace("-", " ")
         head = re.sub(r"^Request:\s*", "", head)
         rest = [l for l in lines if l and not l.startswith("#") and not l.lower().startswith("from:")]
-        out.append({"tone": "warn", "title": f"The chief of staff asks: {first_line(head, 110)}",
-                    "text": first_line(" ".join(rest), 260),
+        c = card.parse(body)
+        out.append({"tone": "warn", "title": f"The chief of staff asks: {first_line(card_head(c) if c else head, 110)}",
+                    "text": first_line(c.get("status") or head, 260) if c else first_line(" ".join(rest), 260),
+                    "card": card_view(c),
                     "steps": ["Read the request (below) and do what it asks, or decide it isn't needed",
                               f"Then tell the chief of staff in the Work group: “request {name} is handled” (or why "
                               "it won't be); it closes the request and this goes away"],

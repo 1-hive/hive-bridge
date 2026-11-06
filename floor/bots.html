@@ -48,6 +48,9 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 .machines { display: flex; flex-wrap: wrap; gap: 8px; }
 .machine { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 14px; border-radius: 99px; background: var(--bg2); border: 1px solid var(--line); font-size: 13px; }
 .machine b { font-family: var(--mono); font-weight: 500; font-size: 12.5px; }
+.card { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--wax); background: rgba(255,255,255,.03); border-radius: 6px; }
+.card p { margin: 0; } .card ol { margin: 2px 0 2px 18px; padding: 0; } .card li { margin: 2px 0; }
+.card .answers { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 2px; } .card .ans { font-size: .9em; opacity: .85; }
 .needs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .need { display: flex; gap: 13px; align-items: flex-start; padding: 13px 16px; border-radius: 14px; background: var(--panel); border: 1px solid var(--line); }
 .need .dot { margin-top: 7px; }
@@ -216,7 +219,14 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 const TG = window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData ? window.Telegram.WebApp : null;
 if (TG) { TG.ready(); TG.expand(); try { TG.setHeaderColor("#11131a"); TG.setBackgroundColor("#11131a"); } catch (e) {} }
 const $ = id => document.getElementById(id);
-const needMore = n => (n.steps && n.steps.length ? `<ol class="steps">${n.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>` : "")
+const cardHtml = c => !c ? "" : `<div class="card">`
+  + (c.status ? `<p>${esc(c.status)}</p>` : "")
+  + (c.before ? `<b>${esc(/^before/i.test(c.before) ? c.before : "Before " + c.before.replace(/^./, x => x.toLowerCase())).replace(/[:.]$/, "")}:</b>` : "")
+  + `<ol>${c.questions.map(q => `<li>${esc(q.q)}${q.answers.length ? `<span class="answers">${q.answers.map(a => `<span class="ans"><b>${esc(a.word)}</b> → ${esc(a.leads)}</span>`).join("")}</span>` : ""}</li>`).join("")}</ol>`
+  + (c.recommend ? `<span class="small">Recommended: ${esc(c.recommend)}</span>` : "")
+  + (c.if_silent ? `<span class="small">If nobody answers: ${esc(c.if_silent)}</span>` : "")
+  + `</div>`;
+const needMore = n => cardHtml(n.card) + (n.steps && n.steps.length ? `<ol class="steps">${n.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>` : "")
   + (n.link && /^https:\/\//.test(n.link.url) ? `<a class="go" href="${esc(n.link.url)}" target="_blank" rel="noopener">${esc(n.link.label)} ↗</a>` : "")
   + (n.detail ? `<details><summary>Read the request</summary><pre>${esc(n.detail)}</pre></details>` : "");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));

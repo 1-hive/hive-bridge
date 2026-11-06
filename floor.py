@@ -466,7 +466,7 @@ def facts() -> fb.Facts:
         up = list(FLOOR_UP)
     return fb.Facts(state=st, events=evs, beacons=beacons, samples=samples, dialogue=dialogue(), groups=GROUPS,
                     conf=CONF, floor_up=up, cos=cos_turns(), merged=merged_map(st, evs), merge_into=dict(MERGE_INTO),
-                    requests=open_requests(), started=STARTED)
+                    requests=open_requests(), started=STARTED, questions=question_texts(st))
 
 
 def open_requests() -> list[dict]:
@@ -481,6 +481,26 @@ def open_requests() -> list[dict]:
             body = subprocess.run(["git", "-C", str(hp.WORKSPACE_REPO), "show", f"main:{x}"],
                                   capture_output=True, text=True, env=env).stdout
             out.append({"name": Path(x).stem, "text": body[:6000]})
+    return out
+
+
+_QUESTIONS: dict[str, str] = {}   # "commit:path" -> text (a pin never changes)
+
+
+def question_texts(st: dict) -> dict:
+    """Each blocked task's question file, read from the workspace at its pin: task -> text (the card lives there)."""
+    env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
+    out = {}
+    for t in st.get("tasks", {}).values():
+        pin = (t.get("block") or {}).get("question") if t.get("status") == "blocked" else None
+        commit, path = (pin or {}).get("commit_oid", "").split(":")[-1], (pin or {}).get("path")
+        if not path or not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+            continue
+        k = f"{commit}:{path}"
+        if k not in _QUESTIONS:
+            r = subprocess.run(["git", "-C", str(hp.WORKSPACE_REPO), "show", k], capture_output=True, text=True, env=env)
+            _QUESTIONS[k] = r.stdout[:20000] if r.returncode == 0 else ""
+        out[t["id"]] = _QUESTIONS[k]
     return out
 
 

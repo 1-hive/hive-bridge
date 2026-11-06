@@ -77,6 +77,7 @@ from pathlib import Path
 
 import card
 import hive_paths as hp
+import decision_buttons as db
 
 CFG = hp.CONFIG_DIR
 STATE = hp.WORK_DIR / ".telegram" / "state.json"
@@ -550,11 +551,62 @@ def on_repo_callback(cq: dict, st: dict, action: str, key: str) -> None:
         CHAT.put((CHAT_CMD, cos, False, None))
 
 
+# Decision cards answered by tapping (decision_buttons.py): the ❓ notice of a worker's card gets one button per
+# answer; an operator's tap is shown on the message and passed to the chief of staff, which records the answer.
+def offer_buttons(st: dict, task: str, c: dict, chat: int, message: dict | None, text: str) -> None:
+    """Put the card's answer buttons on the ❓ message just sent (when any question offers answers)."""
+    if not message or not message.get("message_id"):
+        return
+    st.setdefault("decision_cards", {})
+    key = f"{abs(chat) % 1000000}.{message['message_id']}"   # unique per message, fits callback_data's 64 bytes
+    rows = db.keyboard(c, key)
+    if not rows:
+        return
+    if safe("editMessageReplyMarkup", chat_id=chat, message_id=message["message_id"],
+            reply_markup={"inline_keyboard": rows}) is None:
+        return
+    cards = st["decision_cards"]
+    cards[key] = db.new_entry(task, c, chat, message["message_id"], text)
+    for old in sorted(cards, key=lambda k: cards[k]["message"])[:-200]:   # keep the last 200
+        cards.pop(old, None)
+    save_state(st)
+
+
+def on_decision_callback(cq: dict, st: dict) -> None:
+    frm, msg = cq.get("from") or {}, cq.get("message") or {}
+    parsed = db.parse_data(cq.get("data") or "")
+    entry = (st.get("decision_cards") or {}).get(parsed[0]) if parsed else None
+    if not entry or (msg.get("chat") or {}).get("id") != entry["chat"] or msg.get("message_id") != entry["message"]:
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown question")
+        return
+    if not is_operator(frm.get("id")):
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="only an operator can answer this here")
+        log(f"refused decision tap from {frm.get('id')}")
+        return
+    who = sender_name(frm)
+    ok, note, line, cos = db.tap(entry, parsed[1], parsed[2], who)
+    safe("answerCallbackQuery", callback_query_id=cq["id"], text=note)
+    if not ok:
+        return
+    entry["text"] += "\n" + line
+    save_state(st)
+    log(f"decision {entry['task']} q{parsed[1] + 1}: {line}")
+    rows = db.keyboard(entry["card"], parsed[0], entry["answered"])
+    if safe("editMessageText", chat_id=entry["chat"], message_id=entry["message"], text=entry["text"],
+            disable_web_page_preview=True, reply_markup={"inline_keyboard": rows}) is None:
+        safe("sendMessage", chat_id=entry["chat"], text=line, reply_to_message_id=entry["message"],
+             allow_sending_without_reply=True)
+    if CHAT_CMD:
+        CHAT.put((CHAT_CMD, cos, False, None))
+
+
 def on_callback(cq: dict, st: dict) -> None:
     msg = cq.get("message") or {}
     act, _, rest = (cq.get("data") or "").partition(":")
     if act in ("newrepo", "norepo"):   # posted in group chats too: any operator may decide (on_repo_callback)
         return on_repo_callback(cq, st, act, rest)
+    if act == "dq":                     # a decision card's answer button, in any chat (on_decision_callback)
+        return on_decision_callback(cq, st)
     if not allowed(cq.get("from") or {}, msg.get("chat") or {}):
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="not allowed")
         log(f"refused callback from {cq.get('from', {}).get('id')}")

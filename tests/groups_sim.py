@@ -229,7 +229,7 @@ def main():
     b.push_origins(st)
     lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     edits = [p["text"] for meth, p in sent if meth == "editMessageText"]
-    check("a question is a message of its own, on the status message, whole", lines == [(9500, "❓ tq needs an answer\n\n"
+    check("a question is a message of its own, on the status message, whole", lines == [(9500, "❓ bot3 needs an answer on tq\n\n"
           "which branch?\n\nThe chief of staff answers it, or brings it to you.")], lines)
     check("later steps edit the status message, review rounds numbered", len(edits) == 2 and edits[-1]
           == "tq: started → has a question (operator) → review 1 failed → review 2 passed", edits)
@@ -259,13 +259,29 @@ def main():
     b.push_origins(st)
     msgs = [p["text"] for meth, p in sent if meth == "sendMessage"]
     check("a long question with its file: one shortened message ending at a break, then the file", len(msgs) == 1
-          and msgs[0].startswith("❓ tq needs a decision\n\nI need push access") and " …\n\nThe full question" in msgs[0]
+          and msgs[0].startswith("❓ bot3 needs a decision on tq\n\nI need push access") and " …\n\nThe full question" in msgs[0]
           and len(msgs[0]) < 1500 and len(docs) == 1 and docs[0][1].endswith("logs\n")
           and docs[0][2]["caption"] == "tq: the full question", (msgs, docs))
-    hugeq = ("word " * 1500).strip() + " (B) the end"
+    (ws / "q2.md").write_text("# tq: question 2\n\nworker.bot3, 2026-11-06\n\nStatus: Built and checked, but I can't push it.\n"
+                              "Before: posting the result\n1. Log me in to GitHub? yes: I push / no: see 2\n"
+                              "2. Will you push it yourselves? yes: I post after\nRecommend: 1 yes\n---\nerror: could not read Username\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "q2"], check=True, env=genv)
+    q2 = {**qpin, "commit_oid": "sha1:" + subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(), "path": "q2.md"}
     qevs[:] = [{"position": 61, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
-                "data": {"needs": "access", "reason": hugeq}}]
+                "data": {"needs": "access", "reason": "Before posting the result: 1. Log me in to GitHub? …"}, "refs": [{"rel": "question", "pin": q2}]}]
     st["origin_pos"], docs[:], sent[:] = 60, [], []
+    b.push_origins(st)
+    msgs = [p["text"] for meth, p in sent if meth == "sendMessage"]
+    check("a question with a decision card: the card, not the reason, then the file", msgs == [
+          "❓ bot3 needs access on tq\nBuilt and checked, but I can't push it.\n\nBefore posting the result:\n"
+          "1. Log me in to GitHub? yes: I push / no: see 2\n2. Will you push it yourselves? yes: I post after\n\n"
+          "Recommended: 1 yes\n\nDetails in the file below. The chief of staff answers it, or brings it to you."] and len(docs) == 1, msgs)
+    check("a numbered list with no status or before isn't a card", b.card.parse("Options:\n1. a\n2. b\n---\nx") is None)
+    hugeq = ("word " * 1500).strip() + " (B) the end"
+    qevs[:] = [{"position": 62, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
+                "data": {"needs": "access", "reason": hugeq}}]
+    st["origin_pos"], docs[:], sent[:] = 61, [], []
     b.push_origins(st)
     msgs = [p["text"] for meth, p in sent if meth == "sendMessage"]
     check("a long question without a file: all of it, in pieces split at word breaks", len(msgs) == 2

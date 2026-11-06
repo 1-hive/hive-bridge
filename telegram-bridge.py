@@ -75,6 +75,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import card
 import hive_paths as hp
 
 CFG = hp.CONFIG_DIR
@@ -1314,10 +1315,16 @@ def send_question(task: str, origin: dict, e: dict) -> None:
     reason = (d.get("reason") or "").strip() or "(no question text; see the record)"
     pin = next((r.get("pin") for r in e.get("refs") or [] if r.get("rel") == "question"), None)
     full = result_text(pin or {})
-    body = cut(reason, QUESTION_MAX) if full else reason
-    text = (f"❓ {task} needs {NEEDS.get(d.get('needs'), 'an answer')}\n\n{body}\n\n"
-            + ("The full question, with options and evidence, is in the file below. " if full else "")
-            + "The chief of staff answers it, or brings it to you.")
+    who = str((e.get("actor") or {}).get("id") or "").removeprefix("worker.")
+    head = f"❓ {who or task} needs {NEEDS.get(d.get('needs'), 'an answer')}" + (f" on {task}" if who else "")
+    c = card.parse(full or "")
+    if c:   # the worker filled in a decision card: show it, the details stay in the file
+        text = f"{card.render(c, head)}\n\nDetails in the file below. The chief of staff answers it, or brings it to you."
+    else:
+        body = cut(reason, QUESTION_MAX) if full else reason
+        text = (f"{head}\n\n{body}\n\n"
+                + ("The full question, with options and evidence, is in the file below. " if full else "")
+                + "The chief of staff answers it, or brings it to you.")
     reply = {"reply_to_message_id": origin.get("status_id") or origin["message_id"], "allow_sending_without_reply": True}
     for i, part in enumerate(chunks(text)):
         safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))

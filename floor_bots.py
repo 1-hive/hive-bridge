@@ -289,7 +289,7 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
         return {"state": "cantrun", "headline": "Can't run", "detail": body["problem"][:200], "active": False}
     if body.get("reviewing"):
         r = body["reviewing"]
-        return {"state": "review", "headline": f"Reviewing {r.get('task')}",
+        return {"state": "review", "task": r.get("task"), "headline": f"Reviewing {r.get('task')}",
                 "detail": f"{f.name((f.state['tasks'].get(r.get('task')) or {}).get('owner'))}'s result",
                 "since": r.get("since"), "facts": dur(f.now - (r.get("since") or f.now)), "active": True}
     reqs = body.get("requests") or []
@@ -312,7 +312,7 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
         if working:
             tid = working[0]["task"]
             o = f.origin_text(tid)
-            return {"state": "task", "headline": f"Working on {tid}",
+            return {"state": "task", "task": tid, "headline": f"Working on {tid}",
                     "detail": ((f.state["tasks"][tid].get("title") or "") + (f" · asked {o}" if o else "")),
                     "since": since, "facts": " · ".join(facts), "active": True}
         if body.get("chat") and body["chat"].get("chat_id") is not None:

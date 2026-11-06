@@ -323,6 +323,7 @@ def main():
         assert "Ben" in by["worker.protomegatron"]["now"]["headline"] and "Protobots" in by["worker.protomegatron"]["now"]["headline"]
         assert "grounding lemma" in by["worker.protomegatron"]["now"]["detail"]
         assert by["worker.protomegabot2"]["now"]["state"] == "task", by["worker.protomegabot2"]["now"]
+        assert by["worker.protomegabot2"]["now"]["task"] == "journal-fifo-guard", by["worker.protomegabot2"]["now"]
         assert by["reviewer.astra"]["now"]["state"] == "cantrun"
         assert by["worker.protocosmo2"]["now"]["state"] == "nodata"
         assert any(p["stage"] == "Assigned" for p in by["worker.protomegatron"]["plate"])

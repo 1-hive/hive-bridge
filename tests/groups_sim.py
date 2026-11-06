@@ -29,7 +29,7 @@ def load(groups: bool):
         (cfg / "telegram-groups.json").write_text(json.dumps({
             "chats": [{"name": "main", "chat_id": GROUP, "private": False},
                       {"name": "philosophy", "chat_id": PHILO, "mode": "mention"}],
-            "humans": [{"name": "andy", "user_id": ANDY, "permissions": ["operator"]},
+            "humans": [{"name": "andy", "user_id": ANDY, "username": "glicerico", "permissions": ["operator"]},
                        {"name": "ben", "user_id": BEN, "permissions": ["operator"]}],
             "bots": [{"name": "bot1", "user_id": BOT1, "username": "Bot1Bot", "actor": "worker.bot1"},
                      {"name": "bot3", "user_id": BOT3, "username": "Bot3Bot", "actor": "worker.bot3"}]}))
@@ -136,6 +136,9 @@ def main():
     _, text, _, _ = b.CHAT.get(timeout=5); b.CHAT.task_done()
     env = json.loads(text[len(b.ENVELOPE_HEAD):])
     check("example 2: reply_to says bot1 wrote it, mentions say bot3", env["reply_to"]["from"] == "bot1" and env["mentions"] == ["bot3"], env)
+    check("the envelope lists the humans the CoS may tag, by handle (only those with a username)",
+          {"name": "andy", "handle": "@glicerico", "operator": True} in env["people"]
+          and all(x["handle"].startswith("@") for x in env["people"]), env["people"])
     rules = [json.loads(l) for l in (work / ".telegram" / "addressee-rule.jsonl").read_text().splitlines()]
     check("shadow log: the rule would pick bot1 both times (wrong for example 2)", [r["rule"] for r in rules] == ["bot1", "bot1"], rules)
     b.on_message(msg(GROUP, "group", STRANGER, "spam", 13), st, "COS")

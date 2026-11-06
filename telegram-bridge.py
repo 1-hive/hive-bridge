@@ -86,7 +86,7 @@ ALLOW = json.loads((CFG / "telegram.json").read_text())
 # Group chats (hive-bridge docs/design.md), optional: without this file the bridge serves only the
 # operator's private chat (ALLOW), as before. With it, allowed humans and known bots in group chats:
 # {"chats": [{"name", "chat_id", "private": false, "mode": "all" | "mention"}],
-#  "humans": [{"name", "user_id", "permissions": ["operator"]}], "bots": [{"name", "user_id", "username", "actor"}]}
+#  "humans": [{"name", "user_id", "username", "permissions": ["operator"]}], "bots": [{"name", "user_id", "username", "actor"}]}
 # mode "all" (the work group): every human message goes to the chief of staff. mode "mention" (a conversation
 # group): only messages that @-mention the bridge's bot or reply to it, from humans and from known bots.
 # Every message seen, in every listed chat, goes to the dialogue log (.telegram/dialogue.jsonl).
@@ -94,6 +94,9 @@ _GROUPS_FILE = CFG / "telegram-groups.json"
 GROUPS = json.loads(_GROUPS_FILE.read_text()) if _GROUPS_FILE.is_file() else {}
 CHATS = {c["chat_id"]: c for c in GROUPS.get("chats", [])}
 HUMANS = {h["user_id"]: h for h in GROUPS.get("humans", [])}
+# The humans the chief of staff may tag: "@<username>" in a plain-text reply notifies them (telegram-groups.json)
+PEOPLE = [{"name": h["name"], "handle": f"@{h['username']}", **({"operator": True} if "operator" in h.get("permissions", []) else {})}
+          for h in GROUPS.get("humans", []) if h.get("username")]
 BOTS = {b["user_id"]: b for b in GROUPS.get("bots", [])}
 BOT_NAMES = {b.get("username", "").lower(): b for b in GROUPS.get("bots", []) if b.get("username")}
 THREAD_KEEP = 15        # recent messages per group chat, kept as context for the chief of staff
@@ -775,6 +778,7 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
            **({"reply_to": {"id": rt["message_id"], "from": sender_name(rt.get("from") or {}),
                             "text": (rt.get("text") or rt.get("caption") or "")[:1000]}} if rt else {}),
            "mentions": mentions(m),
+           "people": PEOPLE,
            "thread": st["threads"][str(chat["id"])][:-1],
            "context": record_context()}
     with (STATE.parent / "addressee-rule.jsonl").open("a") as f:   # shadow evidence: the rule never acts

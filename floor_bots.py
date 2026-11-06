@@ -575,7 +575,7 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
                      "Merge it with a merge commit (not squash or rebase): the Floor sees the merge within 5 minutes",
                      f"Shouldn't go in? Delete the branch {branch} instead; that clears this too"]
             out.append({"tone": "ok", "title": f"Merge {f.name(t.get('owner'))}'s {repo} change into {into}",
-                        "text": f"{first_line(t.get('title') or tid, 120)} ({tid}): Astra passed it; it isn't on {into} yet.",
+                        "text": f"{first_line(t.get('title') or tid, 120)} ({tid}): {f.name((t.get('latest_review') or {}).get('reviewer')) if (t.get('latest_review') or {}).get('reviewer') else 'its review'} passed it; it isn't on {into} yet.",
                         "steps": steps, "link": {"label": "Open the pull request", "url": m["url"]} if m.get("url") else None,
                         "who": "operators"})
     for r in f.requests:
@@ -590,7 +590,6 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
                               f"Then tell the chief of staff in the Work group: “request {name} is handled” (or why "
                               "it won't be); it closes the request and this goes away"],
                     "detail": body, "who": "operators"})
-    return out
     return out
 
 

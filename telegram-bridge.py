@@ -1359,7 +1359,7 @@ def chunks(text: str, n: int = 3900) -> list[str]:
     return out + [text] if text else out
 
 
-def send_question(task: str, origin: dict, e: dict) -> None:
+def send_question(task: str, origin: dict, e: dict, st: dict | None = None) -> None:
     """A worker's question, as its own reply under the task's status message: a header saying what it needs, the
     question as the worker put it, then the worker's question file (options, recommendation, evidence). A long
     question is shortened in the chat only when that file goes with it; without the file it is sent whole."""
@@ -1379,7 +1379,9 @@ def send_question(task: str, origin: dict, e: dict) -> None:
                 + "The chief of staff answers it, or brings it to you.")
     reply = {"reply_to_message_id": origin.get("status_id") or origin["message_id"], "allow_sending_without_reply": True}
     for i, part in enumerate(chunks(text)):
-        safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))
+        m = safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))
+        if i == 0 and c and st is not None:   # a card's answers as buttons an operator can tap (decision_buttons.py)
+            offer_buttons(st, task, c, origin["chat_id"], m, part)
     if full:
         f = STATE.parent / "questions" / f"{task}-{e.get('position', 0)}.md"
         try:
@@ -1450,7 +1452,7 @@ def push_origins(st: dict) -> None:
         if e["type"] == "task.blocked":   # a question needs someone: its own message, not only a step
             show_status(t, o[t])
             touched.discard(t)
-            send_question(t, o[t], e)
+            send_question(t, o[t], e, st)
         if e["type"] == "task.closed":
             show_status(t, o[t])
             touched.discard(t)

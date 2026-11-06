@@ -277,6 +277,9 @@ def main():
           "❓ bot3 needs access on tq\nBuilt and checked, but I can't push it.\n\nBefore posting the result:\n"
           "1. Log me in to GitHub? yes: I push / no: see 2\n2. Will you push it yourselves? yes: I post after\n\n"
           "Recommended: 1 yes\n\nDetails in the file below. The chief of staff answers it, or brings it to you."] and len(docs) == 1, msgs)
+    kb = [p["reply_markup"]["inline_keyboard"] for meth, p in sent if meth == "editMessageReplyMarkup"]
+    check("the card's answers become buttons on the ❓ message", kb and [[x["text"] for x in r] for r in kb[0]]
+          == [["1 · yes", "1 · no"]], kb)
     check("a numbered list with no status or before isn't a card", b.card.parse("Options:\n1. a\n2. b\n---\nx") is None)
     hugeq = ("word " * 1500).strip() + " (B) the end"
     qevs[:] = [{"position": 62, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},

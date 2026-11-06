@@ -70,6 +70,9 @@ def main():
     assert n2[-1]["title"] == "reviewer.claude ends long reviews without a verdict" and n2[-1]["detail"].startswith("# reviewer")
     m0 = n2[2]
     assert m0["short"] == "wmtm #1" and m0["title"].endswith("(#1)") and "claude passed it" in m0["text"], m0
+    into["m-7"] = {"into": "main", "repo": "wmtm", "branch": "hive/t-2026-11-06-p4-proof-makeup",
+                   "url": "https://github.com/o/wmtm/compare/main...hive/t-2026-11-06-p4-proof-makeup?expand=1"}
+    assert next(n for n in fb.needs(f2, [], [], []) if "m-7" in n["text"])["short"] == "wmtm p4-proof-makeup"
     st = fb.status(f2, [], n2)["text"]
     print(st)
     assert "❓ <b>Decide:</b> PR: before merging the PR · Should vm2 get more memory?" in st, st

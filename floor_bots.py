@@ -610,7 +610,8 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
                      "Merge it with a merge commit (not squash or rebase): the Floor sees the merge within 5 minutes",
                      f"Shouldn't go in? Delete the branch {branch} instead; that clears this too"]
             pr = re.search(r"/pull/(\d+)", m.get("url") or "")
-            out.append({"group": "merge", "short": f"{repo} #{pr.group(1)}" if pr else f"{repo} {branch}",
+            slug = re.sub(r"^hive/(t-\d{4}-\d{2}-\d{2}-)?", "", branch)   # hive/t-2026-11-06-p4-proof-makeup -> p4-proof-makeup
+            out.append({"group": "merge", "short": f"{repo} #{pr.group(1)}" if pr else f"{repo} {slug}",
                         "url": m.get("url") or "",
                         "tone": "ok", "title": f"Merge {f.name(t.get('owner'))}'s {repo} change into {into}"
                                                + (f" (#{pr.group(1)})" if pr else ""),

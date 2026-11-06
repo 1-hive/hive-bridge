@@ -229,9 +229,10 @@ def main():
     b.push_origins(st)
     lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     edits = [p["text"] for meth, p in sent if meth == "editMessageText"]
-    check("a question is a message of its own, on the status message", lines == [(9500, "tq: has a question (operator): which branch?")], lines)
+    check("a question is a message of its own, on the status message, whole", lines == [(9500, "❓ tq needs an answer\n\n"
+          "which branch?\n\nThe chief of staff answers it, or brings it to you.")], lines)
     check("later steps edit the status message, review rounds numbered", len(edits) == 2 and edits[-1]
-          == "tq: started → has a question (operator): which branch? → review 1 failed → review 2 passed", edits)
+          == "tq: started → has a question (operator) → review 1 failed → review 2 passed", edits)
     # a status message too old to edit (or one Telegram won't edit) is replaced by a new one
     o = b.load_origins()
     o["tq"]["status_at"] -= 48 * 3600
@@ -242,8 +243,35 @@ def main():
     b.push_origins(st)
     lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]
     check("a stale status message is replaced by a new one on the origin message", not [m for m, _ in sent if m == "editMessageText"]
-          and lines == [(13, "tq: started → has a question (operator): which branch? → review 1 failed → review 2 passed → done ✅")]
+          and lines == [(13, "tq: started → has a question (operator) → review 1 failed → review 2 passed → done ✅")]
           and b.load_origins()["tq"]["status_id"] != 9500, (sent, b.load_origins()["tq"]))
+    # a long question: never cut silently. With its question file, shortened at a break and the file attached;
+    # without one, sent whole in as many messages as it takes
+    longq = "I need push access to publish the result. " * 30 + "Options: (A) gh auth login. (B) an operator pushes the branch from this checkout."
+    (ws / "q.md").write_text("# Question\n\n" + longq + "\n\n## Evidence\n\nlogs\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "q"], check=True, env=genv)
+    qhead = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    qpin = {"repository": "workspace", "commit_oid": f"sha1:{qhead}", "path": "q.md"}
+    qevs[:] = [{"position": 60, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
+                "data": {"needs": "decision", "reason": longq}, "refs": [{"rel": "question", "pin": qpin}]}]
+    st["origin_pos"], docs[:], sent[:] = 59, [], []
+    b.push_origins(st)
+    msgs = [p["text"] for meth, p in sent if meth == "sendMessage"]
+    check("a long question with its file: one shortened message ending at a break, then the file", len(msgs) == 1
+          and msgs[0].startswith("❓ tq needs a decision\n\nI need push access") and " …\n\nThe full question" in msgs[0]
+          and len(msgs[0]) < 1500 and len(docs) == 1 and docs[0][1].endswith("logs\n")
+          and docs[0][2]["caption"] == "tq: the full question", (msgs, docs))
+    hugeq = ("word " * 1500).strip() + " (B) the end"
+    qevs[:] = [{"position": 61, "type": "task.blocked", "task": "tq", "actor": {"id": "worker.bot3"},
+                "data": {"needs": "access", "reason": hugeq}}]
+    st["origin_pos"], docs[:], sent[:] = 60, [], []
+    b.push_origins(st)
+    msgs = [p["text"] for meth, p in sent if meth == "sendMessage"]
+    check("a long question without a file: all of it, in pieces split at word breaks", len(msgs) == 2
+          and all(len(m) <= 3900 for m in msgs) and msgs[1].endswith("(B) the end\n\nThe chief of staff answers it, or brings it to you.")
+          and " ".join(msgs).count("word") == 1500 and not docs, [len(m) for m in msgs])
+    check("chunks keeps every character but the breaks", "".join(b.chunks("ab " * 3000)).replace(" ", "") == "ab" * 3000)
     def refuse(method, **p):
         if method == "editMessageText":
             raise RuntimeError("telegram editMessageText: Bad Request: message to edit not found")

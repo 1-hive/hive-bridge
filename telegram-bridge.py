@@ -1271,11 +1271,11 @@ def take_task_lines(reply: str, origin: dict | None) -> str:
 
 ORIGIN_NOTES = {   # record event -> its step in the task's status message on its origin message
     "task.accepted": lambda e, d: "started",
-    "task.blocked": lambda e, d: f"has a question ({d.get('needs')}): {d.get('reason', '')}",
+    "task.blocked": lambda e, d: f"has a question ({d.get('needs')})",   # the question itself: send_question
     "task.result_posted": lambda e, d: "result posted, waiting for review",
     "review.recorded": lambda e, d: f"review {{n}} {d.get('verdict')}",
     "task.closed": lambda e, d: "done ✅",
-    "task.cancelled": lambda e, d: f"cancelled: {d.get('reason', '')}",
+    "task.cancelled": lambda e, d: f"cancelled: {cut(d.get('reason', ''), 300)}",
 }
 ORIGIN_KEEP = 7 * 86400   # a done task's origin is kept this long, for its PR link (telegram-say.py with HIVE_TASK)
 
@@ -1288,6 +1288,47 @@ def status_text(task: str, steps: list) -> str:
 
 
 STATUS_EDIT_FOR = 47 * 3600   # Telegram lets a bot edit its group message for 48 hours
+
+
+QUESTION_MAX = 1200   # a longer question is shortened in the chat when its question file goes with it
+NEEDS = {"decision": "a decision", "information": "information", "access": "access", "external": "something outside the hive"}
+
+
+def chunks(text: str, n: int = 3900) -> list[str]:
+    """text in pieces of at most n characters (a Telegram message holds 4096), each ended at a paragraph, line or
+    word break when one is near: nothing dropped."""
+    out = []
+    while len(text) > n:
+        head = text[:n]
+        i = next((j for brk in ("\n\n", "\n", " ") if (j := head.rfind(brk)) > n // 2), n)
+        out.append(text[:i].rstrip())
+        text = text[i:].lstrip()
+    return out + [text] if text else out
+
+
+def send_question(task: str, origin: dict, e: dict) -> None:
+    """A worker's question, as its own reply under the task's status message: a header saying what it needs, the
+    question as the worker put it, then the worker's question file (options, recommendation, evidence). A long
+    question is shortened in the chat only when that file goes with it; without the file it is sent whole."""
+    d = e.get("data") or {}
+    reason = (d.get("reason") or "").strip() or "(no question text; see the record)"
+    pin = next((r.get("pin") for r in e.get("refs") or [] if r.get("rel") == "question"), None)
+    full = result_text(pin or {})
+    body = cut(reason, QUESTION_MAX) if full else reason
+    text = (f"❓ {task} needs {NEEDS.get(d.get('needs'), 'an answer')}\n\n{body}\n\n"
+            + ("The full question, with options and evidence, is in the file below. " if full else "")
+            + "The chief of staff answers it, or brings it to you.")
+    reply = {"reply_to_message_id": origin.get("status_id") or origin["message_id"], "allow_sending_without_reply": True}
+    for i, part in enumerate(chunks(text)):
+        safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))
+    if full:
+        f = STATE.parent / "questions" / f"{task}-{e.get('position', 0)}.md"
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(full)
+            tg_file("sendDocument", "document", f, chat_id=origin["chat_id"], caption=f"{task}: the full question", **reply)
+        except Exception as ex:
+            log(f"question of {task}: {ex}")
 
 
 def show_status(task: str, origin: dict) -> None:
@@ -1350,8 +1391,7 @@ def push_origins(st: dict) -> None:
         if e["type"] == "task.blocked":   # a question needs someone: its own message, not only a step
             show_status(t, o[t])
             touched.discard(t)
-            safe("sendMessage", chat_id=o[t]["chat_id"], text=f"{t}: {text}"[:1000],
-                 reply_to_message_id=o[t].get("status_id") or o[t]["message_id"], allow_sending_without_reply=True)
+            send_question(t, o[t], e)
         if e["type"] == "task.closed":
             show_status(t, o[t])
             touched.discard(t)
@@ -1516,8 +1556,8 @@ def chat_worker() -> None:
             CHAT.task_done()
             continue
         if not is_noop(reply):
-            for i in range(0, len(reply), 3900):
-                safe("sendMessage", chat_id=chat_id, text=reply[i:i + 3900], **(thread if i == 0 else {}))
+            for i, part in enumerate(chunks(reply)):
+                safe("sendMessage", chat_id=chat_id, text=part, **(thread if i == 0 else {}))
         notes = send_attachments(found, chat_id)
         if notes:
             safe("sendMessage", chat_id=chat_id, text="\n".join(notes))

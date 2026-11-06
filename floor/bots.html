@@ -48,10 +48,24 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 .machines { display: flex; flex-wrap: wrap; gap: 8px; }
 .machine { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 14px; border-radius: 99px; background: var(--bg2); border: 1px solid var(--line); font-size: 13px; }
 .machine b { font-family: var(--mono); font-weight: 500; font-size: 12.5px; }
-.card { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--wax); background: rgba(255,255,255,.03); border-radius: 6px; }
-.card p { margin: 0; } .card ol { margin: 2px 0 2px 18px; padding: 0; } .card li { margin: 2px 0; }
-.card .answers { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 2px; } .card .ans { font-size: .9em; opacity: .85; }
-.needs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.dcard { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--wax); background: rgba(255,255,255,.03); border-radius: 6px; font-size: 14px; }
+.dcard p { margin: 0; } .dcard ol { margin: 2px 0 2px 18px; padding: 0; } .dcard li { margin: 2px 0; }
+.dcard .answers { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 2px; } .dcard .ans { font-size: .9em; opacity: .85; }
+.dcard .small { color: var(--muted); font-size: 12.5px; }
+.dcard b, .need .dcard b { display: inline; font-size: inherit; }
+.dcard .answers { gap: 2px 14px; } .dcard .ans b { font-weight: 650; }
+.need.compact > div { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+.need.compact > div > details { flex: 1; min-width: 220px; }
+.need.compact > div > .go { margin-top: 0; }
+.ngroup { display: flex; flex-direction: column; gap: 8px; }
+.ngroup h3 { margin: 4px 0 0; font-size: 13px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.need.compact { padding: 9px 14px; }
+.need.compact > div > details { margin-top: 2px; }
+.need.compact .go { padding: 2px 9px; }
+.need.compact summary b { display: inline; font-size: 14.5px; }
+.ops > summary { cursor: pointer; color: var(--muted); font-size: 14px; padding: 4px 2px; }
+.ops[open] > summary { margin-bottom: 8px; }
+.needs { display: flex; flex-direction: column; gap: 14px; }
 .need { display: flex; gap: 13px; align-items: flex-start; padding: 13px 16px; border-radius: 14px; background: var(--panel); border: 1px solid var(--line); }
 .need .dot { margin-top: 7px; }
 .need.bad { border-color: rgba(255,125,107,.45); } .need.warn { border-color: rgba(242,181,61,.45); } .need.ok { border-color: rgba(127,211,160,.4); }
@@ -219,13 +233,26 @@ h2 { margin: 0; font-family: var(--body); font-size: 12px; letter-spacing: 1.4px
 const TG = window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData ? window.Telegram.WebApp : null;
 if (TG) { TG.ready(); TG.expand(); try { TG.setHeaderColor("#11131a"); TG.setBackgroundColor("#11131a"); } catch (e) {} }
 const $ = id => document.getElementById(id);
-const cardHtml = c => !c ? "" : `<div class="card">`
+const cardHtml = c => !c ? "" : `<div class="dcard">`
   + (c.status ? `<p>${esc(c.status)}</p>` : "")
   + (c.before ? `<b>${esc(/^before/i.test(c.before) ? c.before : "Before " + c.before.replace(/^./, x => x.toLowerCase())).replace(/[:.]$/, "")}:</b>` : "")
-  + `<ol>${c.questions.map(q => `<li>${esc(q.q)}${q.answers.length ? `<span class="answers">${q.answers.map(a => `<span class="ans"><b>${esc(a.word)}</b> → ${esc(a.leads)}</span>`).join("")}</span>` : ""}</li>`).join("")}</ol>`
+  + `<ol>${c.questions.map(q => `<li>${esc(q.q)}${q.answers.length ? `<span class="answers">${q.answers.map(a => `<span class="ans"><b>${esc(a.word)}</b>: ${esc(a.leads)}</span>`).join("")}</span>` : ""}</li>`).join("")}</ol>`
   + (c.recommend ? `<span class="small">Recommended: ${esc(c.recommend)}</span>` : "")
   + (c.if_silent ? `<span class="small">If nobody answers: ${esc(c.if_silent)}</span>` : "")
   + `</div>`;
+// "Needs you", grouped: decisions open (they need reading), the rest one line each until opened; the chief of
+// staff's requests for hive changes folded into one line, since they're work for the operators, not decisions.
+const NEED_GROUPS = [["decide", "Decide"], ["fix", "Fix"], ["merge", "Merge"], ["ops", "Hive fixes for the operators"]];
+const needDot = n => `<span class="dot k-${n.tone === "bad" ? "bad" : n.tone === "ok" ? "chat" : "task"}" style="${n.tone === "ok" ? "color:var(--ok)" : ""}"></span>`;
+const needOpen = n => `<div class="need ${esc(n.tone)}">${needDot(n)}<div style="flex:1;min-width:0"><b>${esc(n.title)}</b>${n.card ? "" : `<span class="txt">${esc(n.text)}</span>`}${needMore(n)}</div></div>`;
+const needLink = n => n.link && /^https:\/\//.test(n.link.url) ? `<a class="go" href="${esc(n.link.url)}" target="_blank" rel="noopener">${esc(n.link.label)} ↗</a>` : "";
+const needLine = n => `<div class="need compact ${esc(n.tone)}">${needDot(n)}<div style="flex:1;min-width:0"><details><summary><b>${esc(n.title)}</b></summary><span class="txt">${esc(n.text)}</span>${needMore({...n, link: null})}</details>${needLink({...n, link: n.link && {...n.link, label: n.short || n.link.label}})}</div></div>`;
+const needGroups = needs => NEED_GROUPS.map(([g, name]) => {
+  const items = needs.filter(n => (n.group || "decide") === g);
+  if (!items.length) return "";
+  if (g === "ops") return `<details class="ops"><summary>🔧 ${items.length} hive fix${items.length > 1 ? "es" : ""} queued for the operators</summary><div class="ngroup">${items.map(needLine).join("")}</div></details>`;
+  return `<div class="ngroup"><h3>${esc(name)} · ${items.length}</h3>${items.map(g === "decide" ? needOpen : needLine).join("")}</div>`;
+}).join("");
 const needMore = n => cardHtml(n.card) + (n.steps && n.steps.length ? `<ol class="steps">${n.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>` : "")
   + (n.link && /^https:\/\//.test(n.link.url) ? `<a class="go" href="${esc(n.link.url)}" target="_blank" rel="noopener">${esc(n.link.label)} ↗</a>` : "")
   + (n.detail ? `<details><summary>Read the request</summary><pre>${esc(n.detail)}</pre></details>` : "");
@@ -314,8 +341,7 @@ function render() {
   $("head").textContent = "@" + d.head;
   $("clock").textContent = new Date(d.now * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false});
   $("machines").innerHTML = d.machines.map(m => `<span class="machine"><span class="dot small" style="color:${m.ok === false ? "var(--bad)" : m.ok ? "var(--ok)" : "var(--faint)"}"></span><b>${esc(m.name)}</b><span style="color:var(--muted)">${esc(m.status)}</span><span style="color:var(--faint)">${esc(m.runs.join(", "))}</span></span>`).join("");
-  $("needs").innerHTML = d.needs.length ? d.needs.map(n => `<div class="need ${esc(n.tone)}"><span class="dot k-${n.tone === "bad" ? "bad" : n.tone === "ok" ? "chat" : "task"}" style="${n.tone === "ok" ? "color:var(--ok)" : ""}"></span><div style="flex:1;min-width:0"><b>${esc(n.title)}</b><span class="txt">${esc(n.text)}</span>${needMore(n)}</div></div>`).join("")
-    : `<span class="calm">Nothing. The hive is working.</span>`;
+  $("needs").innerHTML = d.needs.length ? needGroups(d.needs) : `<span class="calm">Nothing. The hive is working.</span>`;
   if (!SEL || !d.bots.some(b => b.id === SEL)) SEL = (d.bots.find(b => b.now.active) || d.bots[0] || {}).id;
   $("roster").innerHTML = d.bots.map(card).join("");
   document.querySelectorAll(".card").forEach(c => c.addEventListener("click", () => pick(c.dataset.id)));

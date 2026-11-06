@@ -339,8 +339,10 @@ def main():
         code, needs = get(fbase, "/api/needs")
         titles = [n["title"] for n in needs["needs"]]
         print("needs after:", titles)
-        assert "The chief of staff asks: More memory" in titles, titles
-        req = next(n for n in needs["needs"] if n["title"].startswith("The chief of staff asks"))
+        # a plain request is a hive change for the operators (group "ops"), not a decision: listed last
+        assert "More memory" in titles and titles[-1] == "More memory", titles
+        req = next(n for n in needs["needs"] if n["title"] == "More memory")
+        assert req["group"] == "ops" and needs["needs"][0]["group"] == "fix", needs["needs"]
         assert "more-memory-for-vm2 is handled" in req["steps"][-1] and req["detail"].startswith("# More memory"), req
         assert not any(n["title"].startswith("Merge ") for n in needs["needs"]), "a deleted branch isn't a merge to do"
         code, w = get(fbase, "/api/work")
@@ -353,6 +355,10 @@ def main():
         code, status = get(fbase, "/api/status")
         print("status:\n" + status["text"])
         assert "ProtomegaTron" in status["text"]
+        # grouped, one line per kind: the reviewer that can't run under Fix, the request only counted
+        assert "❗ <b>Fix:</b> Astra can't review" in status["text"], status["text"]
+        assert "🔧 1 hive fix queued for the operators" in status["text"] and "More memory" not in status["text"]
+        assert "For you:" not in status["text"]
         code, page = get(fbase, "/")
         assert code == 200 and "<html" in page
         print("ALL FLOOR CHECKS PASSED")

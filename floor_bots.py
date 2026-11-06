@@ -561,7 +561,8 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
     """What the humans should act on, by fixed rules."""
     out = []
     for i in inbox:
-        out.append({"tone": "bad" if "escalation" in i["kind"] else "warn", "title": i.get("title") or i["kind"],
+        out.append({"group": "decide", "short": first_line(i.get("title") or i["kind"].replace("_", " "), 70),
+                    "tone": "bad" if "escalation" in i["kind"] else "warn", "title": i.get("title") or i["kind"],
                     "text": i["kind"].replace("_", " ") + f" · {i['entity']} {i['id']}",
                     "steps": [f"Tell the chief of staff in the Work group what to do about {i['id']}; it records "
                               "your decision and this goes away"], "who": "operators"})
@@ -575,7 +576,8 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
             continue
         c = card.parse(f.questions.get(i["id"]) or "")
         waited = f"unanswered for {dur(f.now - since) if since else '?'}"
-        out.append({"tone": "warn", "title": f"{f.name(t.get('owner'))} asks: "
+        out.append({"group": "decide", "short": f"{f.name(t.get('owner'))}: " + first_line(card_head(c) if c else b.get('reason', ''), 60),
+                    "tone": "warn", "title": f"{f.name(t.get('owner'))} asks: "
                     + first_line(card_head(c) if c else b.get('reason', ''), 100),
                     "text": f"needs {b.get('needs')} on {i['id']}; {waited}",
                     "card": card_view(c),
@@ -592,10 +594,11 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         n = f"{len(b['plate'])} result{'s' if len(b['plate']) > 1 else ''} waiting, the oldest {dur(oldest)}"
         if b["now"]["state"] == "nodata":
             if oldest > 3600:   # no beacons: maybe it isn't running at all
-                out.append({"tone": "bad", "title": f"{b['name']} hasn't reviewed for {dur(oldest)}",
+                out.append({"group": "fix", "short": f"{b['name']} hasn't reviewed for {dur(oldest)}",
+                            "tone": "bad", "title": f"{b['name']} hasn't reviewed for {dur(oldest)}",
                             "text": f"{n}; its runner sends no beacons: is it running?", "who": "operators"})
         else:
-            out.append({"tone": "bad", "title": f"{b['name']} can't review",
+            out.append({"group": "fix", "short": f"{b['name']} can't review", "tone": "bad", "title": f"{b['name']} can't review",
                         "text": f"{b['now'].get('detail') or b['now']['headline']} · {n}", "who": "operators"})
     for tid, merged in f.merged.items():
         if merged is False:
@@ -606,25 +609,60 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
                      f"In {repo}, open a pull request from {branch} into {into} and look over the change",
                      "Merge it with a merge commit (not squash or rebase): the Floor sees the merge within 5 minutes",
                      f"Shouldn't go in? Delete the branch {branch} instead; that clears this too"]
-            out.append({"tone": "ok", "title": f"Merge {f.name(t.get('owner'))}'s {repo} change into {into}",
+            pr = re.search(r"/pull/(\d+)", m.get("url") or "")
+            out.append({"group": "merge", "short": f"{repo} #{pr.group(1)}" if pr else f"{repo} {branch}",
+                        "url": m.get("url") or "",
+                        "tone": "ok", "title": f"Merge {f.name(t.get('owner'))}'s {repo} change into {into}"
+                                               + (f" (#{pr.group(1)})" if pr else ""),
                         "text": f"{first_line(t.get('title') or tid, 120)} ({tid}): {f.name((t.get('latest_review') or {}).get('reviewer')) if (t.get('latest_review') or {}).get('reviewer') else 'its review'} passed it; it isn't on {into} yet.",
                         "steps": steps, "link": {"label": "Open the pull request", "url": m["url"]} if m.get("url") else None,
                         "who": "operators"})
     for r in f.requests:
-        name, body = r["name"], r.get("text") or ""
+        name, full = r["name"], r.get("text") or ""
+        fm, body = split_front_matter(full)
         lines = [l.strip() for l in body.splitlines()]
         head = next((l.lstrip("# ").strip() for l in lines if l.startswith("#")), "") or name.replace("-", " ")
         head = re.sub(r"^Request:\s*", "", head)
         rest = [l for l in lines if l and not l.startswith("#") and not l.lower().startswith("from:")]
         c = card.parse(body)
-        out.append({"tone": "warn", "title": f"The chief of staff asks: {first_line(card_head(c) if c else head, 110)}",
+        decide = bool(c) or fm.get("kind") in ("decision", "new-repository")
+        named = bool(next((l for l in lines if l.startswith("#")), ""))
+        what = (f"{head}: {card_head(c)}" if named else card_head(c)) if c else head
+        out.append({"group": "decide" if decide else "ops", "short": first_line(what, 60),
+                    "tone": "warn", "title": (f"The chief of staff asks: {first_line(what, 110)}"
+                                              if decide else first_line(head, 120)),
                     "text": first_line(c.get("status") or head, 260) if c else first_line(" ".join(rest), 260),
                     "card": card_view(c),
-                    "steps": ["Read the request (below) and do what it asks, or decide it isn't needed",
-                              f"Then tell the chief of staff in the Work group: “request {name} is handled” (or why "
-                              "it won't be); it closes the request and this goes away"],
-                    "detail": body, "who": "operators"})
-    return out
+                    "steps": ([f"Answer in the Work group (naming {name}): the chief of staff records it and this goes away"]
+                              if c else
+                              ["Read the request (below) and do what it asks, or decide it isn't needed",
+                               f"Then tell the chief of staff in the Work group: “request {name} is handled” (or why "
+                               "it won't be); it closes the request and this goes away"]),
+                    "detail": full, "who": "operators"})
+    order = {g: i for i, g in enumerate(GROUPS)}
+    return sorted(out, key=lambda n: order.get(n.get("group"), len(GROUPS)))
+
+
+# What the humans act on, in the order they see it: decisions, broken machinery, merges, then the chief of staff's
+# requests for hive changes (work for the operators, counted rather than listed in the chat).
+GROUPS = ("decide", "fix", "merge", "ops")
+GROUP_NAMES = {"decide": "Decide", "fix": "Fix", "merge": "Merge", "ops": "Hive fixes for the operators"}
+
+
+def split_front_matter(text: str) -> tuple[dict, str]:
+    """A request's front matter (between leading "---" lines) and the text after it."""
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text or ""
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            fm = {}
+            for x in lines[1:i]:
+                k, sep, v = x.partition(":")
+                if sep:
+                    fm[k.strip().lower()] = v.strip().strip('"').strip("'")
+            return fm, "\n".join(lines[i + 1:])
+    return {}, text
 
 
 STAGES = [("Assigned, not picked up", "assigned"), ("Working", "in_progress"), ("Blocked on a question", "blocked"),
@@ -704,14 +742,20 @@ def machines(f: Facts, roster: list[dict]) -> list[dict]:
     return out
 
 
+def listed(items: list[str], n: int) -> str:
+    """The first n items joined with " · ", then "+k more"."""
+    return " · ".join(items[:n]) + (f" · +{len(items) - n} more" if len(items) > n else "")
+
+
 def status(f: Facts, roster: list[dict], needs_: list[dict]) -> dict:
     """The work group's pinned message (HTML), and its first line on its own."""
     working = sum(1 for b in roster if b["now"]["state"] in ("task", "review") and b["class"] != "chief_of_staff")
     chatting = sum(1 for b in roster if b["now"]["state"] in ("chat", "private"))
     bad = [b["name"] for b in roster if b["now"]["state"] in ("cantrun", "stuck", "offline")]
     parts = [f"{working} working"] + ([f"{chatting} chatting"] if chatting else [])
-    if needs_:
-        parts.append(f"{len(needs_)} for you")
+    mine = [n for n in needs_ if n.get("group") != "ops"]
+    if mine:
+        parts.append(f"{len(mine)} for you")
     word = {"cantrun": "can't run", "stuck": "maybe stuck", "offline": "offline"}
     parts += [f"{b['name']} {word[b['now']['state']]}" for b in roster if b["now"]["state"] in word]
     head = "Hive now: " + " · ".join(parts)
@@ -733,10 +777,23 @@ def status(f: Facts, roster: list[dict], needs_: list[dict]) -> dict:
                 t = f.state["tasks"].get(p["task"]) or {}
                 at = ts((t.get("current_result") or {}).get("at"))
                 wait.append(f"{p['task']} waits for {f.name(t.get('assigned_reviewer'))}" + (f" ({dur(f.now - at)})" if at else ""))
+    lines.append("")
     if wait:
-        lines.append("\n⏳ " + e(" · ".join(wait))[:900])
-    if needs_:
-        lines.append("👉 <b>For you:</b> " + e(" · ".join(n["title"] for n in needs_))[:900])
+        lines.append("⏳ " + e(listed(wait, 3)))
+    icon = {"decide": "❓", "fix": "❗", "merge": "🔀"}
+    for g in ("decide", "fix", "merge"):
+        items = [n for n in needs_ if n.get("group") == g]
+        if not items:
+            continue
+        if g == "merge":
+            shown = [f'<a href="{html.escape(n["url"])}">{e(n["short"])}</a>' if n.get("url", "").startswith("https://")
+                     else e(n["short"]) for n in items]
+            lines.append(f"{icon[g]} <b>{GROUP_NAMES[g]}:</b> " + listed(shown, 6))
+        else:
+            lines.append(f"{icon[g]} <b>{GROUP_NAMES[g]}:</b> " + e(listed([n["short"] for n in items], 3)))
+    ops = [n for n in needs_ if n.get("group") == "ops"]
+    if ops:
+        lines.append(f"🔧 {len(ops)} hive fix{'es' if len(ops) > 1 else ''} queued for the operators (on the Floor)")
     lines.append(f"<i>{time.strftime('%H:%M', time.gmtime(f.now))} UTC · this message updates itself</i>")
     # the agents in trouble, for the bridge to tell the chief of staff (it can't see beacons)
     trouble = [{"id": b["id"], "name": b["name"], "state": b["now"]["state"],

@@ -46,8 +46,36 @@ def main():
     q8 = next(n for n in out if "t-8" in n["text"])
     assert q8["card"] is None and q8["title"] == "protocosmo2 asks: Plain question?" and q8["steps"][0].startswith("Answer in")
     req = next(n for n in out if n["title"].startswith("The chief of staff asks"))
-    assert req["title"] == "The chief of staff asks: before merging the PR" and req["card"]["questions"][1]["answers"][0]["word"] == "yes"
+    assert req["title"] == "The chief of staff asks: Ben's PR: before merging the PR" and req["card"]["questions"][1]["answers"][0]["word"] == "yes"
     assert req["text"].startswith("CettaPack M1 works")
+    assert q9["group"] == "decide" and req["group"] == "decide"
+
+    # front matter: a card after it still parses; kind: decision without a card is a decision; plain text is a hive fix
+    reqs = [{"name": "fm-card", "text": "---\nkind: decision\nasks: ben\n---\n" + CARD.replace("# t-9: question 1", "# PR")},
+            {"name": "fm-plain", "text": "---\nkind: decision\n---\n# Should vm2 get more memory?\n"},
+            {"name": "fix", "text": "# reviewer.claude ends long reviews without a verdict\n\nDetails.\n"}]
+    merges = {f"m-{i}": False for i in range(8)}
+    tasks2 = {**{t: {"id": t, "status": "done", "owner": "worker.protocosmo2", "title": f"Work {t}",
+                     "latest_review": {"reviewer": "reviewer.claude"}} for t in merges}}
+    into = {t: {"into": "main", "repo": "wmtm", "branch": f"hive/{t}", "url": f"https://github.com/o/wmtm/pull/{i + 1}"}
+            for i, t in enumerate(merges)}
+    f2 = fb.Facts(state={"tasks": tasks2, "actors": {}}, events=[], beacons={}, samples={}, dialogue=[], groups={},
+                  conf={}, floor_up=[], now=now, requests=reqs, merged=merges, merge_into=into)
+    n2 = fb.needs(f2, [], [], [])
+    groups = [n["group"] for n in n2]
+    assert groups == ["decide", "decide"] + ["merge"] * 8 + ["ops"], groups
+    assert n2[0]["card"] and n2[0]["title"] == "The chief of staff asks: PR: before merging the PR", n2[0]
+    assert n2[0]["steps"] == ["Answer in the Work group (naming fm-card): the chief of staff records it and this goes away"]
+    assert n2[1]["title"] == "The chief of staff asks: Should vm2 get more memory?", n2[1]["title"]
+    assert n2[-1]["title"] == "reviewer.claude ends long reviews without a verdict" and n2[-1]["detail"].startswith("# reviewer")
+    m0 = n2[2]
+    assert m0["short"] == "wmtm #1" and m0["title"].endswith("(#1)") and "claude passed it" in m0["text"], m0
+    st = fb.status(f2, [], n2)["text"]
+    print(st)
+    assert "❓ <b>Decide:</b> PR: before merging the PR · Should vm2 get more memory?" in st, st
+    assert '🔀 <b>Merge:</b> <a href="https://github.com/o/wmtm/pull/1">wmtm #1</a>' in st and "· +2 more" in st, st
+    assert "🔧 1 hive fix queued for the operators" in st and "without a verdict" not in st
+    assert "10 for you" in st, st   # decisions and merges count; hive fixes don't
     print("PASSED: blocked questions and CoS requests with a card show it (title from Before, answers split); others unchanged")
 
 

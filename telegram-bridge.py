@@ -1078,35 +1078,42 @@ def ping_cos(st: dict, chat_cmd: str) -> None:
 
 
 TROUBLE_AFTER = 600   # seconds an agent must stay offline or unable to run before the chief of staff is told
+TROUBLE_QUIET = 86400   # an agent it was told about is not mentioned again until it has been fine this long
 
 
 def ping_cos_trouble(st: dict, chat_cmd: str) -> None:
     """Tell the chief of staff when an agent has been offline or unable to run (the Floor, from its beacons) for
-    TROUBLE_AFTER seconds, once, and when it recovers: the record can't show either, so without this it learns of it
-    only when a human quotes the board."""
+    TROUBLE_AFTER seconds, once: the record can't show it, so without this it learns of it only when a human quotes
+    the board. The operators get the Floor's own alert and see the agent on the Floor, so the chief of staff is asked
+    to fix it if it can and otherwise say nothing. Not again when it recovers, flaps back, or the bridge restarts,
+    until it has been fine for TROUBLE_QUIET."""
     try:
         now_bad = {b["id"]: b for b in floor_get("/api/status").get("trouble") or []}
     except Exception:
         return   # push_status logs a Floor that isn't answering
-    seen = st.setdefault("trouble", {})   # actor -> {"since", "told"}
+    seen = st.setdefault("trouble", {})   # actor -> {"since", "told", "clear_since"}
     t = time.time()
     for a, b in now_bad.items():
         p = seen.setdefault(a, {"since": t, "told": False})
+        p.pop("clear_since", None)
         if not p["told"] and t - p["since"] >= TROUBLE_AFTER:
             p["told"] = True
             word = "can't run" if b["state"] == "cantrun" else "is offline"
             CHAT.put((chat_cmd, f"The Floor says {b['name']} ({a}) {word}, for {int((t - p['since']) // 60)} min now: "
-                                f"{b['detail'][:300]} This is from its runner's beacons, not the record. Read it with the "
-                                "floor tool, then handle it as your doc says (The Floor). Reply in one line with what you "
-                                "did, or what the operators must do.", False, None))
+                                f"{b['detail'][:300]} This is from its runner's beacons, not the record. The operators "
+                                "already got one alert about it and see it on the Floor, so don't post about it in the "
+                                "chat. If you can fix it yourself (your doc, The Floor), do, and reply in one line with "
+                                "what you did; otherwise reply with nothing. You won't be told again while it lasts.",
+                         False, None))
             log(f"pinged cos: {a} {b['state']}")
     for a in [a for a in seen if a not in now_bad]:
-        p = seen.pop(a)
-        if p["told"]:
-            CHAT.put((chat_cmd, f"The Floor says {a} recovered: it was in trouble for {int((t - p['since']) // 60)} min "
-                                "and its beacons report no problem now. If you told anyone it was down, tell them in one "
-                                "line; otherwise reply with nothing.", False, None))
-            log(f"pinged cos: {a} recovered")
+        p = seen[a]
+        if not p["told"]:
+            seen.pop(a)   # a short spell: never mentioned
+        elif "clear_since" not in p:
+            p["clear_since"] = t
+        elif t - p["clear_since"] >= TROUBLE_QUIET:
+            seen.pop(a)
     save_state(st)
 
 

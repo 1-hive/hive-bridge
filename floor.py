@@ -215,11 +215,28 @@ def keep_log() -> None:
 # --- problems reported in beacons reach the operators -------------------------------------------
 
 ALERT_AFTER = 600          # seconds a problem must last before the operators are told (main: --alert-after)
-CLEAR_AFTER = 120          # seconds without one before a reported problem counts as recovered
-PROBLEMS: dict[str, dict] = {}   # actor -> {"since", "text", "alerted"}
-
-
+QUIET_FOR = 86400          # an agent the operators were told about is not reported again until it has been clear this long
+PROBLEMS: dict[str, dict] = {}   # actor -> {"since", "text"}: problems now, in memory
+ALERTED: dict[str, dict] = {}    # actor -> {"at", "clear_since"}: who the operators were told about (FLOOR_DIR/alerted.json)
+ALERTED_FILE = FLOOR_DIR / "alerted.json"
 ALERTS: list[dict] = []   # {"t", "text"}: alerts for the bridge to send (/api/alerts) when the Floor has no bot token
+
+
+def load_alerted() -> None:
+    try:
+        ALERTED.update(json.loads(ALERTED_FILE.read_text()))
+    except (OSError, ValueError):
+        pass
+
+
+def save_alerted() -> None:
+    try:
+        FLOOR_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ALERTED_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ALERTED))
+        tmp.replace(ALERTED_FILE)
+    except OSError as e:
+        print(f"floor alerted: {e}", flush=True)
 
 
 def say(text: str) -> None:
@@ -245,29 +262,37 @@ def say(text: str) -> None:
 
 
 def watch_problem(actor: str, body: dict, t: float) -> str | None:
-    """An agent whose beacons report a problem for ALERT_AFTER seconds is reported once, and again when its beacons
-    stop reporting one. The problem's wording may change meanwhile (a reviewer's error names each task it tries),
-    so it counts as one problem until it clears. Returns the message to send, if any."""
+    """An agent whose beacons report a problem for ALERT_AFTER seconds is reported to the operators once. Not again
+    while it lasts (its wording may change: a reviewer's error names each task it tries), not when it clears (the
+    Floor shows the agent's state), not after a Floor restart, and not if it comes back within QUIET_FOR of clearing;
+    the Floor's tile and "Needs you" show it meanwhile. Returns the message to send, if any."""
     problem = (body.get("problem") or "").strip()
-    p = PROBLEMS.get(actor)
-    if problem:
-        if p is None:
-            PROBLEMS[actor] = p = {"since": t, "text": problem, "alerted": False}
-        p["text"] = problem
-        p.pop("clear", None)
-        if not p["alerted"] and t - p["since"] >= ALERT_AFTER:
-            p["alerted"] = True
-            what = "reviewer" if body.get("kind") == "reviewer" else "agent"
-            return (f"⚠️ {actor} ({what}) has reported a problem for {int((t - p['since']) // 60)} min: {problem[:300]}"
-                    + ("\nIts reviews aren't being recorded until this is fixed." if what == "reviewer" else ""))
+    seen = ALERTED.get(actor)
+    if not problem:
+        PROBLEMS.pop(actor, None)
+        if seen is not None:
+            if seen.get("clear_since") is None:
+                seen["clear_since"] = t
+                save_alerted()
+            elif t - seen["clear_since"] >= QUIET_FOR:
+                ALERTED.pop(actor)
+                save_alerted()
         return None
-    if p is not None:
-        if p["alerted"] and t - p.setdefault("clear", t) < CLEAR_AFTER:
-            return None              # a restart clears the problem for a moment: recovered only if it stays clear
-        PROBLEMS.pop(actor)
-        if p["alerted"]:
-            return f"✅ {actor} recovered: its beacons report no problem now (it had one for {int((t - p['since']) // 60)} min)."
-    return None
+    p = PROBLEMS.setdefault(actor, {"since": t})
+    p["text"] = problem
+    if t - p["since"] < ALERT_AFTER:
+        return None
+    if seen is not None:   # told already: quiet until it has been clear for QUIET_FOR
+        if seen.get("clear_since") is not None:
+            seen["clear_since"] = None
+            save_alerted()
+        return None
+    ALERTED[actor] = {"at": t, "clear_since": None}
+    save_alerted()
+    what = "reviewer" if body.get("kind") == "reviewer" else "agent"
+    return (f"⚠️ {actor} ({what}) has reported a problem for {int((t - p['since']) // 60)} min: {problem[:300]}"
+            + ("\nIts reviews aren't being recorded until this is fixed." if what == "reviewer" else "")
+            + "\nThe Floor shows it until it's fixed; this alert won't repeat.")
 
 
 def take_beacon(headers, raw: bytes) -> tuple[int, str]:
@@ -868,6 +893,7 @@ def main() -> None:
     ALERT_AFTER = a.alert_after
     client.health()
     load_samples()
+    load_alerted()
     threading.Thread(target=keep_log, daemon=True).start()
     print(f"{hp.HIVE_ID} Floor on http://{a.bind}:{a.port} (view: {CONF.get('view', 'goals')})", flush=True)
     ThreadingHTTPServer((a.bind, a.port), Handler).serve_forever()

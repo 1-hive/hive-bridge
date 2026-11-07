@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The bridge tells the chief of staff when the Floor shows an agent offline or unable to run for 10 minutes (once,
-whatever the wording), and when it recovers; a short spell is never mentioned.
+whatever the wording), not when it recovers or flaps back within a day; a short spell is never mentioned.
 
     python3 tests/trouble_ping_test.py
 """
@@ -60,9 +60,13 @@ def main():
     got = run(300)
     assert len(got) == 1 and "Astra (reviewer.astra) can't run" in got[0] and "47,632" in got[0], got
     assert run(600) == [], "told once"
+    assert "don't post about it" in got[0] and "reply with nothing" in got[0]
     floor["trouble"] = []
-    got = run(60)
-    assert len(got) == 1 and "reviewer.astra recovered" in got[0], got
+    assert run(60) == [], "no recovery message"
+    floor["trouble"] = [astra]
+    assert run(3600) == [] and run(900) == [], "flapping back within a day: quiet"
+    floor["trouble"] = []
+    assert run(60) == [] and run(86400) == [] and "reviewer.astra" not in st["trouble"], "forgotten after a day fine"
     # a short spell: never mentioned, not even its recovery
     floor["trouble"] = [dict(astra, state="offline", detail="No word from its runner since 20:00 UTC.")]
     assert run(60) == [] and run(300) == []
@@ -76,8 +80,8 @@ def main():
         raise OSError("refused")
     b.floor_get = down
     assert run(900) == [] and "reviewer.astra" in st["trouble"]
-    print("PASSED: the chief of staff hears of an agent in trouble after 10 min, once, and of its recovery; "
-          "short spells are silent")
+    print("PASSED: the chief of staff hears of an agent in trouble after 10 min, once (not its recovery, not a flap "
+          "within a day); short spells are silent")
 
 
 if __name__ == "__main__":

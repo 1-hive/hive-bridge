@@ -1616,42 +1616,155 @@ def cos_turn(phase: str, started: float, chat, human: bool) -> None:
         log(f"cos turn log: {e}")
 
 
+# The chief of staff's Claude account at a usage or spend limit: claude prints a line such as "You've hit your
+# individual spend limit · ask your admin to raise it ... resets 2pm (America/Los_Angeles)" instead of an answer.
+COS_LIMIT_RE = re.compile(r"^(you(['’]ve| have) (hit|reached) your [\w ]*limit|claude (ai )?usage limit reached|"
+                          r"credit balance is too low|api error\b.*\b(insufficient_quota|usage limit|spend limit))", re.I)
+COS_LIMIT = STATE.parent / "cos-limit.json"   # {"since", "line", "tried", "told": [chat ids], "held": [items]}
+COS_LIMIT_RETRY = 1200   # seconds between tries of the oldest held message while at the limit
+COS_LIMIT_HOLD = 50      # held messages kept; past that the oldest background ping is dropped
+COS_LIMIT_ADMIN = "https://claude.ai/admin-settings/usage"
+
+
+def limit_line(reply: str) -> str | None:
+    """The limit message, if the reply is nothing but one (short, every line a limit line); else None."""
+    lines = [x.strip() for x in reply.splitlines() if x.strip()]
+    if not lines or len(reply) > 600 or not all(COS_LIMIT_RE.search(x) for x in lines):
+        return None
+    return lines[0][:300]
+
+
+def cos_limit() -> dict:
+    try:
+        return json.loads(COS_LIMIT.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cos_limit(lim: dict) -> None:
+    try:
+        if lim:
+            COS_LIMIT.write_text(json.dumps(lim))
+        else:
+            COS_LIMIT.unlink(missing_ok=True)
+    except OSError as e:
+        log(f"cos limit state: {e}")
+
+
+def hold_for_limit(lim: dict, item: tuple) -> None:
+    """Keep a message for when the chief of staff is back. A human writing in a chat other than the operators' (who
+    got the alert) is told once per limit spell, instead of seeing nothing or the raw limit line."""
+    cmd, text, human, target = item
+    held = lim.setdefault("held", [])
+    held.append([cmd, text, human, target])
+    while len(held) > COS_LIMIT_HOLD:
+        bg = next((i for i, h in enumerate(held) if not h[2]), 0)
+        held.pop(bg)
+    chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
+    told = lim.setdefault("told", [ALLOW["chat_id"]])
+    if human and chat_id not in told:
+        told.append(chat_id)
+        thread = {"reply_to_message_id": target["reply_to"], "allow_sending_without_reply": True} \
+            if target and target.get("reply_to") else {}
+        safe("sendMessage", chat_id=chat_id, text="(The chief of staff is out of usage for now. Your message is saved "
+             "and it will answer when it's back; the operators know.)", **thread)
+
+
+def ask_cos(item: tuple) -> str:
+    cmd, text, human, target = item
+    if human:   # when cos starts on a human's message: the window for follow-ups (check_followups)
+        HUMAN_TURN.write_text(str(time.time()))
+    chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
+    started = time.time()
+    cos_turn("start", started, chat_id if target else None, human)
+    try:
+        safe("sendChatAction", chat_id=chat_id, action="typing")
+        r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
+        reply = (r.stdout or r.stderr or "(no reply)").strip()
+    except subprocess.TimeoutExpired:
+        reply = "(the chief of staff didn't answer in 16 minutes; try again)"
+    except Exception as e:
+        reply = f"(chat failed: {e})"
+    cos_turn("end", started, chat_id if target else None, human)
+    log(f"chat: {len(text)} chars in, {len(reply)} out")
+    return reply
+
+
+def deliver(reply: str, target) -> None:
+    reply = take_task_lines(reply, target)
+    reply, target = route_reply(reply, target)
+    chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
+    thread = {"reply_to_message_id": target["reply_to"], "allow_sending_without_reply": True} \
+        if target and target.get("reply_to") else {}
+    reply, found = split_attachments(reply)
+    if is_noop(reply) and not found:
+        log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
+        return
+    if not is_noop(reply):
+        for i, part in enumerate(chunks(reply)):
+            safe("sendMessage", chat_id=chat_id, text=part, **(thread if i == 0 else {}))
+    notes = send_attachments(found, chat_id)
+    if notes:
+        safe("sendMessage", chat_id=chat_id, text="\n".join(notes))
+
+
+def chat_step(item: tuple | None) -> None:
+    """One message to the chief of staff (item), or, with none waiting (None), a retry of the oldest message held
+    while its account is at a usage limit. At a limit the operators are alerted once, messages are held (not run)
+    and tried again every COS_LIMIT_RETRY seconds; when one is answered the operators hear it's back and the rest
+    are answered in order."""
+    lim = cos_limit()
+    retry = item is None
+    if retry:
+        if not lim or not lim.get("held") or time.time() - lim.get("tried", 0) < COS_LIMIT_RETRY:
+            return
+        item = tuple(lim["held"][0])
+    elif lim:
+        hold_for_limit(lim, item)
+        save_cos_limit(lim)
+        log("chat: held (chief of staff at a usage limit)")
+        return
+    reply = ask_cos(item)
+    line = limit_line(reply)
+    if line:
+        if not lim:
+            lim = {"since": time.time(), "told": [ALLOW["chat_id"]], "held": []}
+            safe("sendMessage", chat_id=ALLOW["chat_id"], text=(
+                f"⛔ The chief of staff can't answer: its Claude account is at a usage limit.\n{line}\n\n"
+                f"Messages to it are held and answered when it's back (it tries again every "
+                f"{COS_LIMIT_RETRY // 60} min). To get it back sooner, raise the limit at {COS_LIMIT_ADMIN}"))
+            log(f"chat: chief of staff at a usage limit: {line}")
+        lim.update(line=line, tried=time.time())
+        if not retry:
+            hold_for_limit(lim, item)
+        save_cos_limit(lim)
+        return
+    if lim:
+        rest = lim.get("held", [])[1 if retry else 0:]
+        save_cos_limit({})
+        hours = (time.time() - lim.get("since", time.time())) / 3600
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=(
+            f"✅ The chief of staff is back after {hours:.1f} h"
+            + (f"; answering {len(rest) + (1 if retry else 0)} held messages now." if rest or retry else ".")))
+        log(f"chat: chief of staff back; {len(rest)} more held")
+        for h in rest:
+            CHAT.put(tuple(h))
+    deliver(reply, item[3])
+
+
 def chat_worker() -> None:
     """Chat with the chief of staff, one message at a time across every chat, off the main loop."""
     while True:
-        cmd, text, human, target = CHAT.get()
-        if human:   # when cos starts on a human's message: the window for follow-ups (check_followups)
-            HUMAN_TURN.write_text(str(time.time()))
-        chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
-        started = time.time()
-        cos_turn("start", started, chat_id if target else None, human)
         try:
-            safe("sendChatAction", chat_id=chat_id, action="typing")
-            r = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True, timeout=960)
-            reply = (r.stdout or r.stderr or "(no reply)").strip()
-        except subprocess.TimeoutExpired:
-            reply = "(the chief of staff didn't answer in 16 minutes; try again)"
-        except Exception as e:
-            reply = f"(chat failed: {e})"
-        cos_turn("end", started, chat_id if target else None, human)
-        log(f"chat: {len(text)} chars in, {len(reply)} out")
-        reply = take_task_lines(reply, target)
-        reply, target = route_reply(reply, target)
-        chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
-        thread = {"reply_to_message_id": target["reply_to"], "allow_sending_without_reply": True} \
-            if target and target.get("reply_to") else {}
-        reply, found = split_attachments(reply)
-        if is_noop(reply) and not found:
-            log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
+            item = CHAT.get(timeout=60)
+        except queue.Empty:
+            item = None
+        try:
+            chat_step(item)
+        except Exception as e:   # keep the worker up
+            log(f"chat: {e}")
+        if item is not None:
             CHAT.task_done()
-            continue
-        if not is_noop(reply):
-            for i, part in enumerate(chunks(reply)):
-                safe("sendMessage", chat_id=chat_id, text=part, **(thread if i == 0 else {}))
-        notes = send_attachments(found, chat_id)
-        if notes:
-            safe("sendMessage", chat_id=chat_id, text="\n".join(notes))
-        CHAT.task_done()
 
 
 def main() -> None:

@@ -1110,6 +1110,24 @@ def ping_cos_trouble(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
+def relay_floor_alerts(st: dict) -> None:
+    """Send the operators the Floor's alerts (an agent reporting a problem for 10 min, and its recovery). A Floor
+    without the bot's token (it faces the internet) queues them at /api/alerts; each is sent once."""
+    try:
+        alerts = floor_get(f"/api/alerts?after={st.get('floor_alert_t', 0)}").get("alerts") or []
+    except Exception:
+        return   # an older Floor, or one that isn't answering (push_status logs that)
+    for a in alerts:
+        try:
+            tg("sendMessage", chat_id=ALLOW["chat_id"], text=a["text"][:4000])
+        except Exception as e:
+            log(f"floor alert not sent: {e}")
+            break
+        st["floor_alert_t"] = a["t"]
+        save_state(st)
+        log(f"floor alert sent: {a['text'][:80]}")
+
+
 FOLLOWUPS = hp.WORK_DIR / "cos" / "followups"
 FOLLOWUP_WINDOW_S, FOLLOWUP_AHEAD_S, FOLLOWUP_MAX = 16 * 60, 2 * 3600, 3
 
@@ -1667,6 +1685,7 @@ def main() -> None:
                     push_origins(st)
                     push_status(st)
                 push_repo_requests(st)
+                relay_floor_alerts(st)
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)

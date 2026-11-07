@@ -10,6 +10,7 @@ Run with the hiverecord tool's Python (it imports the record client). Two views:
 
 API:
   /api/bots, /api/bot/<actor>   the roster, and one actor with its timeline (floor_bots.py)
+  /api/alerts?after=T           operator alerts for the bridge to send, when the Floor has no bot token
   /api/needs, /api/work, /api/chats, /api/machines, /api/status   the rest of the bots view; status is the
                                 text the Telegram bridge pins in the work group
   POST /api/beacon              a signed beacon from an agent's sidecar or runner (hive-runtime)
@@ -218,8 +219,18 @@ CLEAR_AFTER = 120          # seconds without one before a reported problem count
 PROBLEMS: dict[str, dict] = {}   # actor -> {"since", "text", "alerted"}
 
 
+ALERTS: list[dict] = []   # {"t", "text"}: alerts for the bridge to send (/api/alerts) when the Floor has no bot token
+
+
 def say(text: str) -> None:
-    """One message to the operators' chat (the bridge's bot and chat, as telegram-say.py), off the request thread."""
+    """One message to the operators' chat. A Floor that holds the bot's token (telegram-token) sends it itself, off
+    the request thread; a deployment that keeps the token from the Floor (proto-hive: it faces the internet) gets it
+    from /api/alerts, where the bridge picks it up and sends it."""
+    if not (CFG / "telegram-token").is_file():
+        ALERTS.append({"t": time.time(), "text": text[:4000]})
+        del ALERTS[:-50]
+        return
+
     def send():
         try:
             import urllib.parse
@@ -752,7 +763,13 @@ def check_init_data(init: str) -> int | None:
 
 # --- HTTP ----------------------------------------------------------------------------------------
 
-API = {"/api/events": api_events, "/api/state": api_state, "/api/live": api_live, "/api/bots": api_bots,
+def api_alerts(q: dict) -> dict:
+    """The operator alerts waiting for the bridge (say), oldest first; the bridge sends those newer than ?after=<t>."""
+    after = float((q.get("after") or ["0"])[0] or 0)
+    return {"alerts": [a for a in list(ALERTS) if a["t"] > after]}
+
+
+API = {"/api/events": api_events, "/api/alerts": api_alerts, "/api/state": api_state, "/api/live": api_live, "/api/bots": api_bots,
        "/api/needs": api_needs, "/api/work": api_work, "/api/chats": api_chats, "/api/status": api_status,
        "/api/all": api_all}
 

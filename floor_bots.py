@@ -252,6 +252,11 @@ def request_line(f: Facts, req: dict) -> tuple[str, str, str]:
     return "chat", f"Answering a message in {where}", ""
 
 
+# A beacon problem that is the agent's model account out of money (hive-runtime's reviewer runner, and an OpenClaw
+# sidecar from the agent's last failed turn): any agent with it can't run, a worker as much as a reviewer.
+ACCOUNT_LIMIT = "its model account hit a usage limit"
+
+
 def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
     """The headline: the first rule that applies (States sheet: offline › can't run › stuck › task › chat › own ›
     waiting › idle)."""
@@ -285,7 +290,8 @@ def now_line(f: Facts, actor: str, cls: str, plate_: list[dict]) -> dict:
     ep = next((e for e in reversed(body.get("episodes") or []) if e[1] is None), None)
     model = model_name(ep[2] if ep else None) or model_name(((f.state.get("actors") or {}).get(actor, {})
                                                              .get("declaration") or {}).get("model_route"))
-    if body.get("kind") == "reviewer" and body.get("problem") and not body.get("reviewing"):
+    if body.get("kind") == "reviewer" and body.get("problem") and not body.get("reviewing") \
+            or ACCOUNT_LIMIT in (body.get("problem") or ""):
         return {"state": "cantrun", "headline": "Can't run", "detail": body["problem"][:200], "active": False}
     if body.get("reviewing"):
         r = body["reviewing"]
@@ -600,6 +606,16 @@ def needs(f: Facts, inbox: list[dict], cos_inbox: list[dict], roster: list[dict]
         else:
             out.append({"group": "fix", "short": f"{b['name']} can't review", "tone": "bad", "title": f"{b['name']} can't review",
                         "text": f"{b['now'].get('detail') or b['now']['headline']} · {n}", "who": "operators"})
+    for b in roster:   # a worker whose model account is out of money holds its tasks until someone pays
+        if b["class"] != "worker" or b["now"]["state"] != "cantrun" or not b["plate"]:
+            continue
+        n = len(b["plate"])
+        out.append({"group": "fix", "short": f"{b['name']} can't work", "tone": "bad", "title": f"{b['name']} can't work",
+                    "text": f"{b['now'].get('detail') or b['now']['headline']} · {n} task{'s' if n > 1 else ''} on its plate",
+                    "steps": ["Top up or raise the limit on that model account (whoever owns it); the agent picks up "
+                              "again on its next turn",
+                              "Meanwhile the chief of staff can move tasks that can run elsewhere"],
+                    "who": "operators"})
     for tid, merged in f.merged.items():
         if merged is False:
             t = f.state["tasks"][tid]

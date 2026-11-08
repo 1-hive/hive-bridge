@@ -82,5 +82,36 @@ def main():
     print("PASSED: blocked questions and CoS requests with a card show it (title from Before, answers split); others unchanged")
 
 
+def account_limit():
+    """A worker whose sidecar reports its model account out of money can't run, shows under ❗ Fix while it holds
+    tasks, and a plain sidecar problem (a folder it can't read) stays a note."""
+    now = time.time()
+    tasks = {"t-7": {"id": "t-7", "status": "in_progress", "owner": "worker.protocosmopopos", "title": "Roman list"}}
+    actors = {a: {"class": "worker", "declaration": {"harness": "openclaw"}} for a in ("worker.protocosmopopos", "worker.x")}
+    evs = [{"type": "task.assigned", "task": "t-7", "recorded_at": "2026-11-08T18:51:11Z", "actor": {"id": "cos"},
+            "data": {"assignee": "worker.protocosmopopos"}}]
+    prob = ("its model account hit a usage limit: 429 This request would exceed your account's monthly spend limit.")
+    beacons = {"worker.protocosmopopos": {"received": now - 5, "body": {"kind": "openclaw", "problem": prob, "last_step": now - 600}},
+               "worker.x": {"received": now - 5, "body": {"kind": "openclaw", "problem": "can't read /x: Permission denied"}}}
+    f = fb.Facts(state={"tasks": tasks, "actors": actors}, events=evs, beacons=beacons, samples={}, dialogue=[],
+                 groups={}, conf={}, floor_up=[], now=now)
+    roster = [fb.bot(f, a) for a in actors]
+    by = {b["id"]: b for b in roster}
+    assert by["worker.protocosmopopos"]["now"]["state"] == "cantrun", by["worker.protocosmopopos"]["now"]
+    assert "spend limit" in by["worker.protocosmopopos"]["now"]["detail"]
+    assert by["worker.x"]["now"]["state"] != "cantrun" and "can't read" in by["worker.x"]["note"]
+    out = fb.needs(f, [], [], roster)
+    fix = [n for n in out if n["group"] == "fix"]
+    if by["worker.protocosmopopos"]["plate"]:
+        assert [n["title"] for n in fix] == ["protocosmopopos can't work"], fix
+        assert "spend limit" in fix[0]["text"] and "1 task" in fix[0]["text"], fix
+    else:
+        raise AssertionError(f"no plate for the assigned task: {by['worker.protocosmopopos']}")
+    st = fb.status(f, roster, out)
+    assert "protocosmopopos can't run" in st["head"] or "protocosmopopos" in st["text"], st
+
+
 if __name__ == "__main__":
     main()
+    account_limit()
+    print("PASSED: a worker out of model credit can't run and shows under Fix; other sidecar problems stay notes")

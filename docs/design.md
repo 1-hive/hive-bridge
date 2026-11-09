@@ -49,7 +49,7 @@ This departs from the roadmap's "deterministic addressee classification" (M1 cha
 
 `mentions` and `reply_to` are facts for the chief of staff to weigh, not instructions.
 
-**Files.** A document or photo in a chat the bridge serves is downloaded (Bot API: up to 20 MB) into `.telegram/attachments/` (group-readable, kept 30 days) and listed under `message.files` or `reply_to.files`. A text file (.md, .txt, code, data) comes inline under `text`, up to 60,000 characters. Every file has its `path`. Thread entries name their files. When someone sends a file on its own and then a separate message about it, the file comes with that next message. A captionless file in an "all" group goes to the chief of staff like any message. Voice, video and stickers are named, not downloaded. In a private chat, files come as `[attached file: …]` blocks after the text.
+**Files.** A document or photo in a chat the bridge serves is downloaded (Bot API: up to 20 MB) into `.telegram/attachments/` (group-readable, kept 5 days) and listed under `message.files` or `reply_to.files`. A text file (.md, .txt, code, data) comes inline under `text`, up to 60,000 characters. Every file has its `path`. Thread entries name their files. When someone sends a file on its own and then a separate message about it, the file comes with that next message. A captionless file in an "all" group goes to the chief of staff like any message. Voice, video and stickers are named, not downloaded. In a private chat, files come as `[attached file: …]` blocks after the text.
 
 ## Context block
 

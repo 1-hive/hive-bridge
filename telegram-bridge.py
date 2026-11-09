@@ -1223,7 +1223,7 @@ def last_human_turn() -> float:
 # files up to 20 MB) and shown to the chief of staff with the message: a text file (.md, .txt, code, ...) inline, up
 # to INLINE_CHARS, and every file by its path. The folder is group-readable: on vm2 the user cos is in group hive.
 INBOX = STATE.parent / "attachments"
-INBOX_BYTES, INBOX_KEEP_DAYS, INLINE_CHARS = 20 * 1024 * 1024, 30, 60_000
+INBOX_BYTES, INBOX_KEEP_DAYS, INLINE_CHARS = 20 * 1024 * 1024, 5, 60_000
 TEXT_TYPES = {".md", ".markdown", ".txt", ".text", ".rst", ".org", ".tex", ".csv", ".tsv", ".json", ".jsonl", ".yaml",
               ".yml", ".toml", ".ini", ".cfg", ".conf", ".log", ".diff", ".patch", ".html", ".xml", ".py", ".metta",
               ".sh", ".js", ".ts", ".rs", ".go", ".c", ".h", ".cpp", ".hpp", ".java", ".scm", ".pl", ".lean", ".sql"}

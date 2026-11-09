@@ -679,7 +679,7 @@ def remember(st: dict, m: dict) -> None:
     """Keep the group's recent messages, humans' and bots', as thread context, and log every one."""
     th = st.setdefault("threads", {}).setdefault(str(m["chat"]["id"]), [])
     rt = m.get("reply_to_message") or {}
-    files = [{k: d[k] for k in ("name", "path", "note") if d.get(k)} for d in files_of(m, inline=False)]
+    files = [{k: d[k] for k in ("name", "path", "text_path", "note") if d.get(k)} for d in files_of(m, inline=False)]
     entry = {"id": m["message_id"], "from": sender_name(m.get("from") or {}),
              "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {}),
              **({"files": files} if files else {})}
@@ -782,8 +782,8 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
             and prev.get("id") != rt.get("message_id")):
         files = [{"from_message": prev["id"], **d} for d in prev["files"]]
         for d in files:
-            p = Path(d.get("path") or "")
-            if is_text(p.name) and p.is_file():
+            p = Path(d.get("text_path") or d.get("path") or "")
+            if (d.get("text_path") or is_text(p.name)) and p.is_file():
                 d.update(read_text(p))
     rt_files = files_of(rt) if rt else []
     env = {"chat": {"id": chat["id"], "name": CHATS.get(chat["id"], {}).get("name", chat.get("title")),
@@ -1286,6 +1286,30 @@ def read_text(p: Path) -> dict:
                if len(text) > INLINE_CHARS else {})}
 
 
+def pdf_text(p: Path) -> Path | str:
+    """A PDF's text beside it (`<file>.txt`, pdftotext -layout from poppler-utils), so agents without a PDF reader
+    read it as text; or why there is none."""
+    out = p.with_name(p.name + ".txt")
+    if out.is_file():
+        return out
+    try:
+        r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), str(out)], capture_output=True,
+                           text=True, timeout=120)
+    except FileNotFoundError:
+        return "no text copy: pdftotext (poppler-utils) isn't installed"
+    except subprocess.TimeoutExpired:
+        out.unlink(missing_ok=True)
+        return "no text copy: pdftotext took over 2 minutes"
+    if r.returncode != 0 or not out.is_file():
+        out.unlink(missing_ok=True)
+        return f"no text copy: pdftotext failed ({(r.stderr or '').strip()[:200]})"
+    out.chmod(0o640)
+    if not out.read_text(errors="replace").strip():
+        out.unlink()
+        return "no text copy: the PDF has no text layer (scanned?); read it as a PDF at path"
+    return out
+
+
 def is_text(name: str, mime: str | None = None) -> bool:
     return Path(name).suffix.lower() in TEXT_TYPES or (mime or "").startswith("text/")
 
@@ -1302,6 +1326,14 @@ def files_of(m: dict, inline: bool = True) -> list[dict]:
                 d["path"] = str(p)
                 if inline and is_text(f["name"], f.get("type")):
                     d.update(read_text(p))
+                elif p.suffix.lower() == ".pdf" or f.get("type") == "application/pdf":
+                    t = pdf_text(p)
+                    if isinstance(t, Path):
+                        d["text_path"] = str(t)
+                        if inline:
+                            d.update(read_text(t))
+                    else:
+                        d["note"] = t
             except Exception as e:
                 d["note"] = f"couldn't download: {e}"
                 log(f"attachment {f['name']!r} in message {m.get('message_id')}: {e}")
@@ -1314,6 +1346,7 @@ def files_block(files: list[dict]) -> str:
     parts = []
     for d in files:
         head = f"[attached file: {d['name']}" + (f", {d['path']}" if d.get("path") else "") + \
+               (f"; its text: {d['text_path']}" if d.get("text_path") else "") + \
                (f"; {d['note']}" if d.get("note") else "") + (f"; {d['truncated']}" if d.get("truncated") else "") + "]"
         parts.append(head + (f"\n{d['text']}\n[end of {d['name']}]" if d.get("text") else ""))
     return "\n\n" + "\n\n".join(parts) if parts else ""

@@ -39,7 +39,7 @@ This departs from the roadmap's "deterministic addressee classification" (M1 cha
 ```json
 {
   "chat": {"id": "<platform chat id>", "name": "…", "kind": "group | private", "private": false},
-  "message": {"id": "…", "at": "<RFC 3339>", "text": "…", "attachments": ["…"]},
+  "message": {"id": "…", "at": "<RFC 3339>", "text": "…", "files": [{"name", "type", "bytes", "path", "text"}]},
   "from": {"human": "andy", "permissions": ["operator"]},
   "reply_to": {"id": "…", "from": "bot1", "text": "…", "task": "<record task id, if the bridge knows it>"},
   "mentions": ["bot1", "bot3"],
@@ -48,6 +48,8 @@ This departs from the roadmap's "deterministic addressee classification" (M1 cha
 ```
 
 `mentions` and `reply_to` are facts for the chief of staff to weigh, not instructions.
+
+**Files.** A document or photo in a chat the bridge serves is downloaded (Bot API: up to 20 MB) into `.telegram/attachments/` (group-readable, kept 30 days) and listed under `message.files` or `reply_to.files`. A text file (.md, .txt, code, data) comes inline under `text`, up to 60,000 characters. Every file has its `path`. Thread entries name their files. When someone sends a file on its own and then a separate message about it, the file comes with that next message. A captionless file in an "all" group goes to the chief of staff like any message. Voice, video and stickers are named, not downloaded. In a private chat, files come as `[attached file: …]` blocks after the text.
 
 ## Context block
 

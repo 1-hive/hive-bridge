@@ -679,8 +679,10 @@ def remember(st: dict, m: dict) -> None:
     """Keep the group's recent messages, humans' and bots', as thread context, and log every one."""
     th = st.setdefault("threads", {}).setdefault(str(m["chat"]["id"]), [])
     rt = m.get("reply_to_message") or {}
+    files = [{k: d[k] for k in ("name", "path", "note") if d.get(k)} for d in files_of(m, inline=False)]
     entry = {"id": m["message_id"], "from": sender_name(m.get("from") or {}),
-             "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {})}
+             "text": (m.get("text") or m.get("caption") or "")[:500], **({"reply_to": rt["message_id"]} if rt else {}),
+             **({"files": files} if files else {})}
     th.append(entry)
     del th[:-THREAD_KEEP]
     try:
@@ -742,7 +744,8 @@ ENVELOPE_HEAD = ("A message from a group chat. You are the hive's only interpret
                  "Your reply goes to this chat, as a reply to this message. To send a later message to a group "
                  "(e.g. a result), start a reply with a line [[to: <chat name>]]. When you create a task for this message, add a "
                  "line [[task: <task id>]] to your reply: the bridge then threads that task's progress (result, review, "
-                 "done) on this message.\n\n")
+                 "done) on this message. Files people attach are under message.files (and reply_to.files): a text "
+                 "file's content is inline under text, and any file can be read at its path; thread entries name theirs.\n\n")
 
 
 def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
@@ -759,7 +762,7 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         log(f"group {chat['id']}: ignored message from {frm.get('id')}")
         return
     text = (m.get("text") or m.get("caption") or "").strip()
-    if not text:
+    if not text and not message_files(m):
         return
     if text.split("@")[0] == "/board":
         safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"],
@@ -770,13 +773,28 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
              reply_to_message_id=m["message_id"], **floor_markup())
         return
     rt = m.get("reply_to_message") or {}
+    files = files_of(m)
+    # A file sent on its own, then a separate message about it (Telegram sends a file and its text apart unless
+    # the text is a caption): the sender's file-only message just before this one comes with it
+    th = st["threads"][str(chat["id"])]
+    prev = th[-2] if len(th) > 1 else {}
+    if (not files and prev.get("files") and not prev.get("text") and prev.get("from") == sender_name(frm)
+            and prev.get("id") != rt.get("message_id")):
+        files = [{"from_message": prev["id"], **d} for d in prev["files"]]
+        for d in files:
+            p = Path(d.get("path") or "")
+            if is_text(p.name) and p.is_file():
+                d.update(read_text(p))
+    rt_files = files_of(rt) if rt else []
     env = {"chat": {"id": chat["id"], "name": CHATS.get(chat["id"], {}).get("name", chat.get("title")),
                     "kind": "group", "private": CHATS.get(chat["id"], {}).get("private", False)},
-           "message": {"id": m["message_id"], "at": dt.datetime.fromtimestamp(m["date"], dt.UTC).isoformat(), "text": text},
+           "message": {"id": m["message_id"], "at": dt.datetime.fromtimestamp(m["date"], dt.UTC).isoformat(), "text": text,
+                       **({"files": files} if files else {})},
            "from": ({"bot": sender_name(frm), "actor": BOTS.get(frm.get("id"), {}).get("actor")} if is_bot
                     else {"human": sender_name(frm), "permissions": (["operator"] if is_operator(frm.get("id")) else [])}),
            **({"reply_to": {"id": rt["message_id"], "from": sender_name(rt.get("from") or {}),
-                            "text": (rt.get("text") or rt.get("caption") or "")[:1000]}} if rt else {}),
+                            "text": (rt.get("text") or rt.get("caption") or "")[:1000],
+                            **({"files": rt_files} if rt_files else {})}} if rt else {}),
            "mentions": mentions(m),
            "people": PEOPLE,
            "thread": st["threads"][str(chat["id"])][:-1],
@@ -807,7 +825,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if (m.get("chat") or {}).get("type") in ("group", "supergroup") and (m["chat"]["id"] in CHATS or m["chat"]["id"] == ALLOW["chat_id"]):
         on_group_message(m, st, chat_cmd)
         return
-    text = (m.get("text") or "").strip()
+    text = (m.get("text") or m.get("caption") or "").strip()
     frm, chat = m.get("from") or {}, m.get("chat") or {}
     if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0] in ("/floor", "/start floor", "/board"):
         private_floor(chat["id"], frm["id"], text)
@@ -844,7 +862,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat_cmd:
         if CHAT.unfinished_tasks:
             safe("sendMessage", chat_id=ALLOW["chat_id"], text="(queued: the chief of staff is still on your last message)")
-        CHAT.put((chat_cmd, text, True, None))
+        CHAT.put((chat_cmd, text + files_block(files_of(m)), True, None))
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text="Chat with the chief of staff isn't connected yet; buttons and /inbox work.")
@@ -854,7 +872,7 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     """Another operator's private chat (telegram-groups.json humans with the operator permission, e.g. Ben): help, and
     the chief of staff, whose reply comes back here. The buttons, inbox and digest stay in telegram.json's chat."""
     who = (HUMANS.get(frm.get("id")) or {}).get("name") or frm.get("first_name") or str(frm.get("id"))
-    if text.split("@")[0] in ("/start", "/help") or not text:
+    if text.split("@")[0] in ("/start", "/help") or not (text or message_files(m)):
         safe("sendMessage", chat_id=chat["id"], text=f"{hp.HIVE_ID}: write here to talk to the chief of staff, the "
              "hive's coordinator; it answers in this chat. /floor opens the Floor (what each agent is doing now, what "
              "it owes, and what needs you); /board shows the same in a message.")
@@ -865,7 +883,7 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     if CHAT.unfinished_tasks:
         safe("sendMessage", chat_id=chat["id"], text="(queued: the chief of staff is on another message)")
     CHAT.put((chat_cmd, f"A private message to you from {who}, an operator of the hive. Your reply goes back to "
-              f"{who} in that private chat.\n\n{text}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
+              f"{who} in that private chat.\n\n{text}{files_block(files_of(m))}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
     log(f"private message from operator {who} to the chief of staff")
 
 
@@ -1199,6 +1217,106 @@ def last_human_turn() -> float:
         return float(HUMAN_TURN.read_text())
     except (OSError, ValueError):
         return 0.0
+
+
+# Files people send: a document or a photo in a chat the bridge serves is downloaded here (the Bot API hands a bot
+# files up to 20 MB) and shown to the chief of staff with the message: a text file (.md, .txt, code, ...) inline, up
+# to INLINE_CHARS, and every file by its path. The folder is group-readable: on vm2 the user cos is in group hive.
+INBOX = STATE.parent / "attachments"
+INBOX_BYTES, INBOX_KEEP_DAYS, INLINE_CHARS = 20 * 1024 * 1024, 30, 60_000
+TEXT_TYPES = {".md", ".markdown", ".txt", ".text", ".rst", ".org", ".tex", ".csv", ".tsv", ".json", ".jsonl", ".yaml",
+              ".yml", ".toml", ".ini", ".cfg", ".conf", ".log", ".diff", ".patch", ".html", ".xml", ".py", ".metta",
+              ".sh", ".js", ".ts", ".rs", ".go", ".c", ".h", ".cpp", ".hpp", ".java", ".scm", ".pl", ".lean", ".sql"}
+
+
+def message_files(m: dict) -> list[dict]:
+    """The files a Telegram message carries: a document, the largest size of a photo; other media by kind only."""
+    out = []
+    if m.get("document"):
+        d = m["document"]
+        out.append({"id": d["file_id"], "name": d.get("file_name") or f"file-{m['message_id']}",
+                    "type": d.get("mime_type"), "bytes": d.get("file_size")})
+    if m.get("photo"):
+        p = max(m["photo"], key=lambda p: (p.get("file_size") or 0, p.get("width", 0) * p.get("height", 0)))
+        out.append({"id": p["file_id"], "name": f"photo-{m['message_id']}.jpg", "type": "image/jpeg",
+                    "bytes": p.get("file_size")})
+    for kind in ("audio", "voice", "video", "video_note", "animation", "sticker"):
+        if m.get(kind):
+            out.append({"name": (m[kind].get("file_name") or kind), "type": m[kind].get("mime_type"),
+                        "note": f"a {kind.replace('_', ' ')}: not downloaded, ask for it as a file"})
+    return out
+
+
+def fetch_file(chat_id, message_id, f: dict) -> Path:
+    """Download one file into INBOX, once (named after its chat and message)."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f["name"]).strip("._") or "file"
+    dest = INBOX / f"{str(chat_id).lstrip('-')}-{message_id}-{safe_name[:100]}"
+    if dest.is_file():
+        return dest
+    if (f.get("bytes") or 0) > INBOX_BYTES:
+        raise ValueError("over 20 MB, Telegram doesn't hand those to a bot")
+    info = tg("getFile", file_id=f["id"])
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{info['file_path']}", timeout=120) as r:
+        data = r.read(INBOX_BYTES + 1)
+    if len(data) > INBOX_BYTES:
+        raise ValueError("over 20 MB")
+    INBOX.mkdir(mode=0o750, parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    tmp.write_bytes(data)
+    tmp.chmod(0o640)
+    tmp.replace(dest)
+    prune_inbox()
+    return dest
+
+
+def prune_inbox() -> None:
+    cut = time.time() - INBOX_KEEP_DAYS * 86400
+    for p in INBOX.glob("*"):
+        try:
+            if p.stat().st_mtime < cut:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def read_text(p: Path) -> dict:
+    text = p.read_bytes().decode("utf-8", errors="replace")
+    return {"text": text[:INLINE_CHARS],
+            **({"truncated": f"first {INLINE_CHARS} of {len(text)} characters; the rest is in the file at path"}
+               if len(text) > INLINE_CHARS else {})}
+
+
+def is_text(name: str, mime: str | None = None) -> bool:
+    return Path(name).suffix.lower() in TEXT_TYPES or (mime or "").startswith("text/")
+
+
+def files_of(m: dict, inline: bool = True) -> list[dict]:
+    """The message's files for the chief of staff: name, type, size, the local path, and a text file's content.
+    A file that can't be downloaded is listed with why, never silently dropped."""
+    out = []
+    for f in message_files(m):
+        d = {k: f[k] for k in ("name", "type", "bytes", "note") if f.get(k)}
+        if "id" in f:
+            try:
+                p = fetch_file(m["chat"]["id"], m["message_id"], f)
+                d["path"] = str(p)
+                if inline and is_text(f["name"], f.get("type")):
+                    d.update(read_text(p))
+            except Exception as e:
+                d["note"] = f"couldn't download: {e}"
+                log(f"attachment {f['name']!r} in message {m.get('message_id')}: {e}")
+        out.append(d)
+    return out
+
+
+def files_block(files: list[dict]) -> str:
+    """Attached files as text after a private message to the chief of staff."""
+    parts = []
+    for d in files:
+        head = f"[attached file: {d['name']}" + (f", {d['path']}" if d.get("path") else "") + \
+               (f"; {d['note']}" if d.get("note") else "") + (f"; {d['truncated']}" if d.get("truncated") else "") + "]"
+        parts.append(head + (f"\n{d['text']}\n[end of {d['name']}]" if d.get("text") else ""))
+    return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
 COS_WORKSPACE = hp.WORK_DIR / "cos" / "workspace"

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Files the chief of staff sends, and transcripts: a reply's [[file: …]] may name the workspace or the outbox (by
 /cos/… or host path) and nothing else, up to 50 MB and more types (zip, docx); the bridge's own messages in a group
-go in the dialogue log; /transcript sends a group's log as Markdown, by chat name across a supergroup upgrade,
-without /board; the outbox is pruned after 7 days.
+go in the dialogue log; transcript.py makes a group's Markdown transcript, by chat name across a supergroup
+upgrade, without /board; the outbox is pruned after 7 days.
 
     python3 tests/outgoing_files_test.py
 """
@@ -132,6 +132,7 @@ def main():
     b.prune_outbox()
     assert not (box / "t1").exists() and (box / "report.docx").exists()
 
+    import transcript
     # 5. the transcript: by chat name across the old chat id (message ids reused), no /board, replies quoted right
     b.DIALOGUE.write_text("".join(json.dumps(e) + "\n" for e in [
         {"chat": -5, "chat_name": "work", "at": "2026-10-21T10:00:00+00:00", "from": "andy", "id": 7, "text": "old hello"},
@@ -145,33 +146,22 @@ def main():
         {"chat": -100, "chat_name": "work", "at": "2026-11-02T09:00:00+00:00", "from": "zar", "id": 12, "text": "",
          "files": [{"name": "plan.pdf"}]},
     ]))
-    md = b.transcript.build(b.transcript.read(b.DIALOGUE), "work", hive_id="test-hive")
+    md = transcript.build(transcript.read(b.DIALOGUE), "work", hive_id="test-hive")
     assert "4 messages, 2026-10-21 to 2026-11-02" in md, md
     assert "old hello" in md and "elsewhere" not in md and "BOARD" not in md and "/board" not in md, md
     assert '**10:01 hive** _(to zar: "new question?")_' in md, md
     assert "## 2026-11-02" in md and "[file: plan.pdf]" in md, md
-    week = b.transcript.build(b.transcript.read(b.DIALOGUE), "work", 7,
+    week = transcript.build(transcript.read(b.DIALOGUE), "work", 7,
                               now=b.dt.datetime(2026, 11, 3, tzinfo=b.dt.UTC))
     assert "old hello" not in week and "new question?" in week, week
 
-    # 6. /transcript in the group: a Markdown file back, as a reply; in a private chat: [chat] [days]
-    calls.clear()
-    b.save_state = lambda st: None
-    st = {"threads": {}, "pending_reason": {}}
-    b.on_group_message({"message_id": 60, "date": int(time.time()), "chat": {"id": -100, "type": "supergroup"},
-                        "from": {"id": 7, "first_name": "Zar"}, "text": "/transcript"}, st, "chat")
-    sent = [c for c in calls if c[0] == "sendDocument"]
-    assert len(sent) == 1 and sent[0][1]["document"].startswith("test-hive-work-chat-") and sent[0][1]["reply_to_message_id"] == "60", calls
-    assert b.CHAT.empty(), "a /transcript isn't for the chief of staff"
-    calls.clear()
-    b.private_transcript(1, ["talk", "3"])
-    assert calls[-1][0] == "sendDocument" and calls[-1][1]["document"].endswith("-3d.md") and "talk" in calls[-1][1]["caption"], calls
-    calls.clear()
-    b.private_transcript(1, [])
-    assert "work" in calls[-1][1]["caption"], calls
-    calls.clear()
-    b.private_transcript(1, ["nosuch"])
-    assert calls[-1][0] == "sendMessage" and "chats: work, talk" in calls[-1][1]["text"], calls
+    # 6. the command line, as the chief of staff runs it: a chat that isn't there names the ones that are
+    import subprocess
+    r = subprocess.run([sys.executable, str(HERE / "transcript.py"), str(b.DIALOGUE), "work", "3650"],
+                       capture_output=True, text=True, env={**os.environ, "HIVE_ID": "test-hive"})
+    assert r.returncode == 0 and r.stdout.startswith("# test-hive: the work group") and "new question?" in r.stdout, r
+    r = subprocess.run([sys.executable, str(HERE / "transcript.py"), str(b.DIALOGUE), "nosuch"], capture_output=True, text=True)
+    assert r.returncode != 0 and "chats: work, talk" in r.stderr, r
     print("ok")
 
 

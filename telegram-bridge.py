@@ -41,8 +41,8 @@ out of the text and the file sent with sendPhoto or sendDocument: at most 5 per 
 types. Outbox files go after 7 days.
 
 Transcripts: the dialogue log (.telegram/dialogue.jsonl) has every message in the group chats,
-the bridge's own included. /transcript in a group sends that group's as a Markdown file;
-an operator's private chat takes /transcript [chat name] [days].
+the bridge's own included; transcript.py makes one group's Markdown transcript from it (the chief of
+staff runs it when asked, and sends the file like any other).
 
 The digest lists results waiting more than an hour for a verdict, with what the review is doing.
 
@@ -84,7 +84,6 @@ from pathlib import Path
 import card
 import hive_paths as hp
 import decision_buttons as db
-import transcript
 
 CFG = hp.CONFIG_DIR
 STATE = hp.WORK_DIR / ".telegram" / "state.json"
@@ -803,11 +802,6 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"],
              disable_web_page_preview=True, **floor_markup())
         return
-    if text.split("@")[0].split(" ")[0] == "/transcript":
-        args = text.split()[1:]
-        send_transcript(chat["id"], CHATS.get(chat["id"], {}).get("name") or "", args[0] if args else None,
-                        reply_to=m["message_id"])
-        return
     if text.split("@")[0] == "/floor" and FLOOR_PUBLIC:
         safe("sendMessage", chat_id=chat["id"], text="The Floor opens from a private chat with me: tap below, then Start.",
              reply_to_message_id=m["message_id"], **floor_markup())
@@ -870,9 +864,6 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0] in ("/floor", "/start floor", "/board"):
         private_floor(chat["id"], frm["id"], text)
         return
-    if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0].split(" ")[0] == "/transcript":
-        private_transcript(chat["id"], text.split()[1:])
-        return
     if chat.get("type") == "private" and chat.get("id") != ALLOW["chat_id"] and is_operator(frm.get("id")):
         other_operator(m, frm, chat, text, chat_cmd)
         return
@@ -892,8 +883,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
-                "/digest sends the digest now; /board shows what each agent is doing; /transcript [chat] [days] sends a group's "
-                "transcript"
+                "/digest sends the digest now; /board shows what each agent is doing"
                 + ("; /floor opens the Floor." if FLOOR_PUBLIC else "."))
         return
     if text == "/digest":
@@ -919,8 +909,7 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     if text.split("@")[0] in ("/start", "/help") or not (text or message_files(m)):
         safe("sendMessage", chat_id=chat["id"], text=f"{hp.HIVE_ID}: write here to talk to the chief of staff, the "
              "hive's coordinator; it answers in this chat. /floor opens the Floor (what each agent is doing now, what "
-             "it owes, and what needs you); /board shows the same in a message; /transcript [chat] [days] sends a group's "
-             "transcript as a file.")
+             "it owes, and what needs you); /board shows the same in a message.")
         return
     if not chat_cmd:
         safe("sendMessage", chat_id=chat["id"], text="Chat with the chief of staff isn't connected; /floor and /board work.")
@@ -930,55 +919,6 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     CHAT.put((chat_cmd, f"A private message to you from {who}, an operator of the hive. Your reply goes back to "
               f"{who} in that private chat.\n\n{text}{files_block(files_of(m))}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
     log(f"private message from operator {who} to the chief of staff")
-
-
-EXPORTS = STATE.parent / "exports"   # transcripts as sent, kept a day
-
-
-def send_transcript(chat_id: int, name: str, days: str | None = None, reply_to: int | None = None) -> None:
-    """A group chat's transcript (transcript.py), as a Markdown file, to chat_id: /transcript [days]."""
-    reply = {"reply_to_message_id": reply_to, "allow_sending_without_reply": True} if reply_to else {}
-    try:
-        d = float(days) if days else None
-        if d is not None and d <= 0:
-            raise ValueError
-    except ValueError:
-        safe("sendMessage", chat_id=chat_id, text="/transcript takes a number of days, e.g. /transcript 7", **reply)
-        return
-    text = transcript.build(transcript.read(DIALOGUE), name, d, hive_id=hp.HIVE_ID)
-    EXPORTS.mkdir(parents=True, exist_ok=True)
-    cut = time.time() - 86400
-    for old in EXPORTS.glob("*.md"):
-        try:
-            if old.stat().st_mtime < cut:
-                old.unlink()
-        except OSError:
-            pass
-    f = EXPORTS / f"{hp.HIVE_ID}-{name}-chat-{dt.date.today().isoformat()}{f'-{d:g}d' if d else ''}.md"
-    f.write_text(text)
-    try:
-        tg_file("sendDocument", "document", f, chat_id=chat_id,
-                caption=f"The {name} group" + (f", last {d:g} days" if d else ", everything the bridge has logged"),
-                **reply)
-        log(f"transcript of {name} sent to {chat_id} ({len(text)} chars)")
-    except Exception as e:
-        log(f"transcript of {name}: {e}")
-        safe("sendMessage", chat_id=chat_id, text=f"(couldn't send the transcript: {e})", **reply)
-
-
-def private_transcript(chat_id: int, args: list[str]) -> None:
-    """An operator's /transcript [chat name] [days], in a private chat. Without a name: the first group with mode all."""
-    names = [c.get("name") for c in CHATS.values() if c.get("name")]
-    name = next((a for a in args if a.lower() in {n.lower() for n in names}), None)
-    days = next((a for a in args if a.replace(".", "", 1).isdigit()), None)
-    rest = [a for a in args if a not in (name, days)]
-    if rest or not names:
-        safe("sendMessage", chat_id=chat_id, text="/transcript [chat] [days]; chats: " + (", ".join(names) or "none"))
-        return
-    if name is None:
-        name = next((c["name"] for c in CHATS.values() if c.get("mode", "all") == "all" and c.get("name")), names[0])
-    name = next(n for n in names if n.lower() == name.lower())
-    send_transcript(chat_id, name, days)
 
 
 FLOOR = os.environ.get("FLOOR_URL", "http://127.0.0.1:8476")

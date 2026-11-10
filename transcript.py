@@ -1,20 +1,21 @@
 """A group chat's transcript, as Markdown, from the bridge's dialogue log (.telegram/dialogue.jsonl).
 
-    python3 transcript.py <dialogue.jsonl> <chat name> [days]      (prints it)
+    python3 transcript.py <dialogue.jsonl> <chat name> [days] > <file>.md
 
 The log has every message the bridge saw in its group chats, and its own messages there ("sent": true: the chief of
-staff's replies, task progress, decision cards). The bridge's /transcript sends this as a file. Lines are chosen by
-chat name, so a group Telegram upgraded to a supergroup (a new chat id, message ids starting again) stays one chat.
-Left out: /board, /transcript and the bridge's answers to them.
+staff's replies, task progress, decision cards). The chief of staff runs this when someone asks for a transcript and
+sends the file. Lines are chosen by chat name, so a group Telegram upgraded to a supergroup (a new chat id, message
+ids starting again) stays one chat. Left out: /board and the like, and the bridge's answers to them.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 
-COMMANDS = ("/board", "/floor", "/transcript", "/start", "/help")
+COMMANDS = ("/board", "/floor", "/start", "/help", "/digest", "/inbox")
 
 
 def read(path: Path) -> list[dict]:
@@ -88,5 +89,9 @@ def chat_names(lines: list[dict]) -> list[str]:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        sys.exit(__doc__.split("\n\n")[1])
-    print(build(read(Path(sys.argv[1])), sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else None))
+        sys.exit(__doc__.split("\n\n")[1] + "\nchats: " + ", ".join(chat_names(read(Path(sys.argv[1]))) if len(sys.argv) > 1 else []))
+    lines = read(Path(sys.argv[1]))
+    if sys.argv[2] not in chat_names(lines):
+        sys.exit(f"no chat {sys.argv[2]!r} in the log; chats: {', '.join(chat_names(lines)) or 'none'}")
+    print(build(lines, sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else None,
+                hive_id=os.environ.get("HIVE_ID") or "hive"))

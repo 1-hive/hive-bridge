@@ -6,7 +6,9 @@ Deterministic, no model. It:
   pending exception) with buttons, and again as a reminder while it is still
   waiting after --remind-hours (so an old request doesn't get buried);
 - turns button taps into signed record events: goal.approved, goal.accepted,
-  goal.reopened (asks for the reason as a reply) and goal.abandoned;
+  goal.reopened (asks for the reason as a reply) and goal.abandoned; and Restart on a task
+  the supervisor gave up on (repeated_failure, stuck): task.escalation_resolved "Restart:", the
+  same as `op restart` (hive-runtime v0.5.59 restarts the worker and counts attempts anew);
 - accepts taps and replies only from the configured chat and user;
 - sends the digest (PLAN D15) once a day at --digest-at, local time: per goal, its
   status, its tasks and anything open, plus what changed since the last digest.
@@ -222,7 +224,28 @@ def buttons(item: dict) -> list:
 def budget_kb(item: dict) -> list:
     if item["kind"] == "escalation_open" and item["entity"] == "goal" and item["title"].startswith("budget_exceeded"):
         return [[{"text": "⏱ +4h", "callback_data": f"budget:{item['id']}:4"}]]
+    return restart_kb(item)
+
+
+RESTART_CODES = ("repeated_failure", "stuck")   # the supervisor's escalations a fresh attempt answers
+
+
+def restart_kb(item: dict) -> list:
+    """A task the supervisor gave up on: a tap gives it a fresh attempt (the same as `op restart`)."""
+    if (item["kind"] == "escalation_open" and item["entity"] == "task" and item["title"].startswith(RESTART_CODES)
+            and len(f"restart:{item['id']}".encode()) <= 64):
+        return [[{"text": "🔁 Restart", "callback_data": f"restart:{item['id']}"}]]
     return []
+
+
+def restart_task(tid: str) -> tuple[bool, str]:
+    """Resolve the task's escalation with "Restart:", which the supervisor (hive-runtime v0.5.59) takes as the
+    operator's request for a fresh attempt: it restarts the worker and counts its attempts anew."""
+    ok, out = hive("emit", "task.escalation_resolved", "--task", tid, "--data", json.dumps({"resolution": "Restart:"}))
+    if ok:
+        return True, (f"{tid}: escalation resolved at position {json.loads(out)['position']}; "
+                      "the supervisor restarts the worker within a minute or two")
+    return False, f"{tid}: refused: {(out.splitlines() or ['?'])[-1][:250]}"
 
 
 HEAD = {"goal_proposed": "🆕 Goal to approve", "goal_completed": "🏁 Goal completed: accept or reopen",
@@ -666,6 +689,16 @@ def on_callback(cq: dict, st: dict) -> None:
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         ok, info = extend_budget(gid, float(hours), "telegram")
         log(f"budget {gid} +{hours}h: {info}")
+        st["decided"] = (st["decided"] + [key])[-200:]
+        save_state(st)
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+             reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"{'✅' if ok else '❌'} {info}")
+        return
+    if action == "restart":
+        safe("answerCallbackQuery", callback_query_id=cq["id"])
+        ok, info = restart_task(gid)
+        log(f"restart {gid}: {info}")
         st["decided"] = (st["decided"] + [key])[-200:]
         save_state(st)
         safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],

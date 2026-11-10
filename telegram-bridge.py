@@ -34,9 +34,15 @@ the bridge wakes it at that time and forwards the reply. Only a file written wit
 on its own), at most 2 hours ahead and 3 pending (1-hive PLAN D15, 2026-10-14).
 
 A chat reply may carry attachments: a line of its own `[[photo: <path>]]` or `[[file: <path>]]`,
-the path inside the chief of staff's workspace clone (relative, or under /cos/workspace). The
-line is taken out of the text and the file sent with sendPhoto or sendDocument: at most 5 per
-reply, 10 MB each, never a file outside that clone (symlinks resolved), only listed types.
+the path inside the chief of staff's workspace clone (relative, or under /cos/workspace) or its
+outbox (HIVE_COS_OUTBOX, or /cos/outbox), where it copies other files to send. The line is taken
+out of the text and the file sent with sendPhoto or sendDocument: at most 5 per reply, 50 MB each
+(Telegram's limit for a bot), never a file outside those two (symlinks resolved), only listed
+types. Outbox files go after 7 days.
+
+Transcripts: the dialogue log (.telegram/dialogue.jsonl) has every message in the group chats,
+the bridge's own included. /transcript in a group sends that group's as a Markdown file;
+an operator's private chat takes /transcript [chat name] [days].
 
 The digest lists results waiting more than an hour for a verdict, with what the review is doing.
 
@@ -78,6 +84,7 @@ from pathlib import Path
 import card
 import hive_paths as hp
 import decision_buttons as db
+import transcript
 
 CFG = hp.CONFIG_DIR
 STATE = hp.WORK_DIR / ".telegram" / "state.json"
@@ -123,7 +130,35 @@ def tg(method: str, **params) -> dict:
             out = {"description": str(e)}
     if not out.get("ok"):
         raise RuntimeError(f"telegram {method}: {out.get('description', out)}")
+    note_sent(method, params, out["result"])
     return out["result"]
+
+
+def note_sent(method: str, params: dict, res) -> None:
+    """The bridge's own messages in a group chat go in the dialogue log too (replies, task progress, decision cards),
+    so a transcript has both sides. Not the pinned status (sent silently and edited in place)."""
+    if method not in ("sendMessage", "sendPhoto", "sendDocument") or params.get("disable_notification") \
+            or not isinstance(res, dict):
+        return
+    try:
+        cid = int(params.get("chat_id"))
+    except (TypeError, ValueError):
+        return
+    if cid not in CHATS:
+        return
+    doc = res.get("document") or {}
+    rt = (res.get("reply_to_message") or {}).get("message_id")
+    try:
+        with DIALOGUE.open("a") as f:
+            f.write(json.dumps({"chat": cid, "chat_name": CHATS[cid].get("name"),
+                                "at": dt.datetime.fromtimestamp(res.get("date", 0), dt.UTC).isoformat(),
+                                "from_id": (res.get("from") or {}).get("id"), "bot": True, "sent": True,
+                                "id": res.get("message_id"), "from": sender_name(res.get("from") or {}),
+                                "text": res.get("text") or res.get("caption") or "",
+                                **({"reply_to": rt} if rt else {}),
+                                **({"files": [{"name": doc["file_name"]}]} if doc.get("file_name") else {})}) + "\n")
+    except OSError as e:
+        log(f"dialogue log: {e}")
 
 
 def safe(method: str, **params) -> dict | None:
@@ -768,6 +803,11 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         safe("sendMessage", chat_id=chat["id"], text=board_text(), parse_mode="HTML", reply_to_message_id=m["message_id"],
              disable_web_page_preview=True, **floor_markup())
         return
+    if text.split("@")[0].split(" ")[0] == "/transcript":
+        args = text.split()[1:]
+        send_transcript(chat["id"], CHATS.get(chat["id"], {}).get("name") or "", args[0] if args else None,
+                        reply_to=m["message_id"])
+        return
     if text.split("@")[0] == "/floor" and FLOOR_PUBLIC:
         safe("sendMessage", chat_id=chat["id"], text="The Floor opens from a private chat with me: tap below, then Start.",
              reply_to_message_id=m["message_id"], **floor_markup())
@@ -830,6 +870,9 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0] in ("/floor", "/start floor", "/board"):
         private_floor(chat["id"], frm["id"], text)
         return
+    if chat.get("type") == "private" and is_operator(frm.get("id")) and text.split("@")[0].split(" ")[0] == "/transcript":
+        private_transcript(chat["id"], text.split()[1:])
+        return
     if chat.get("type") == "private" and chat.get("id") != ALLOW["chat_id"] and is_operator(frm.get("id")):
         other_operator(m, frm, chat, text, chat_cmd)
         return
@@ -849,7 +892,8 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
-                "/digest sends the digest now; /board shows what each agent is doing"
+                "/digest sends the digest now; /board shows what each agent is doing; /transcript [chat] [days] sends a group's "
+                "transcript"
                 + ("; /floor opens the Floor." if FLOOR_PUBLIC else "."))
         return
     if text == "/digest":
@@ -875,7 +919,8 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     if text.split("@")[0] in ("/start", "/help") or not (text or message_files(m)):
         safe("sendMessage", chat_id=chat["id"], text=f"{hp.HIVE_ID}: write here to talk to the chief of staff, the "
              "hive's coordinator; it answers in this chat. /floor opens the Floor (what each agent is doing now, what "
-             "it owes, and what needs you); /board shows the same in a message.")
+             "it owes, and what needs you); /board shows the same in a message; /transcript [chat] [days] sends a group's "
+             "transcript as a file.")
         return
     if not chat_cmd:
         safe("sendMessage", chat_id=chat["id"], text="Chat with the chief of staff isn't connected; /floor and /board work.")
@@ -885,6 +930,55 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
     CHAT.put((chat_cmd, f"A private message to you from {who}, an operator of the hive. Your reply goes back to "
               f"{who} in that private chat.\n\n{text}{files_block(files_of(m))}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
     log(f"private message from operator {who} to the chief of staff")
+
+
+EXPORTS = STATE.parent / "exports"   # transcripts as sent, kept a day
+
+
+def send_transcript(chat_id: int, name: str, days: str | None = None, reply_to: int | None = None) -> None:
+    """A group chat's transcript (transcript.py), as a Markdown file, to chat_id: /transcript [days]."""
+    reply = {"reply_to_message_id": reply_to, "allow_sending_without_reply": True} if reply_to else {}
+    try:
+        d = float(days) if days else None
+        if d is not None and d <= 0:
+            raise ValueError
+    except ValueError:
+        safe("sendMessage", chat_id=chat_id, text="/transcript takes a number of days, e.g. /transcript 7", **reply)
+        return
+    text = transcript.build(transcript.read(DIALOGUE), name, d, hive_id=hp.HIVE_ID)
+    EXPORTS.mkdir(parents=True, exist_ok=True)
+    cut = time.time() - 86400
+    for old in EXPORTS.glob("*.md"):
+        try:
+            if old.stat().st_mtime < cut:
+                old.unlink()
+        except OSError:
+            pass
+    f = EXPORTS / f"{hp.HIVE_ID}-{name}-chat-{dt.date.today().isoformat()}{f'-{d:g}d' if d else ''}.md"
+    f.write_text(text)
+    try:
+        tg_file("sendDocument", "document", f, chat_id=chat_id,
+                caption=f"The {name} group" + (f", last {d:g} days" if d else ", everything the bridge has logged"),
+                **reply)
+        log(f"transcript of {name} sent to {chat_id} ({len(text)} chars)")
+    except Exception as e:
+        log(f"transcript of {name}: {e}")
+        safe("sendMessage", chat_id=chat_id, text=f"(couldn't send the transcript: {e})", **reply)
+
+
+def private_transcript(chat_id: int, args: list[str]) -> None:
+    """An operator's /transcript [chat name] [days], in a private chat. Without a name: the first group with mode all."""
+    names = [c.get("name") for c in CHATS.values() if c.get("name")]
+    name = next((a for a in args if a.lower() in {n.lower() for n in names}), None)
+    days = next((a for a in args if a.replace(".", "", 1).isdigit()), None)
+    rest = [a for a in args if a not in (name, days)]
+    if rest or not names:
+        safe("sendMessage", chat_id=chat_id, text="/transcript [chat] [days]; chats: " + (", ".join(names) or "none"))
+        return
+    if name is None:
+        name = next((c["name"] for c in CHATS.values() if c.get("mode", "all") == "all" and c.get("name")), names[0])
+    name = next(n for n in names if n.lower() == name.lower())
+    send_transcript(chat_id, name, days)
 
 
 FLOOR = os.environ.get("FLOOR_URL", "http://127.0.0.1:8476")
@@ -1352,10 +1446,18 @@ def files_block(files: list[dict]) -> str:
     return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
-COS_WORKSPACE = hp.WORK_DIR / "cos" / "workspace"
-ATTACH_MAX, ATTACH_BYTES = 5, 10 * 1024 * 1024
+# The files a chat reply may attach: the chief of staff's workspace clone, and its outbox, a folder it copies other
+# files into (from a task's result branch, say). Where cos's own folder is private to it (proto-hive: /var/lib/hive/cos,
+# 700), the outbox is the only one the bridge can read: HIVE_COS_OUTBOX, a folder cos writes and the bridge's group
+# reads. As cos sees them in a container: /cos/workspace and /cos/outbox.
+COS_WORKSPACE = Path(os.environ.get("HIVE_COS_WORKSPACE") or hp.WORK_DIR / "cos" / "workspace")
+COS_OUTBOX = Path(os.environ.get("HIVE_COS_OUTBOX") or hp.WORK_DIR / "cos" / "outbox")
+OUTBOX_KEEP_DAYS = 7
+ATTACH_MAX, ATTACH_BYTES, PHOTO_BYTES = 5, 50 * 1024 * 1024, 10 * 1024 * 1024   # Bot API: 50 MB a file, 10 MB a photo
 PHOTO_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
-FILE_TYPES = PHOTO_TYPES | {".gif", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html"}
+FILE_TYPES = PHOTO_TYPES | {".gif", ".svg", ".pdf", ".txt", ".md", ".csv", ".tsv", ".json", ".jsonl", ".log", ".html",
+                            ".yaml", ".yml", ".toml", ".xml", ".tex", ".bib", ".ipynb", ".py", ".patch", ".diff",
+                            ".zip", ".gz", ".tgz", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".mp4", ".webm"}
 ATTACH_LINE = re.compile(r"^\s*\[\[(photo|file):\s*(.+?)\s*\]\]\s*$", re.I)
 
 
@@ -1372,23 +1474,41 @@ def split_attachments(reply: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 def attachment(raw: str) -> Path:
-    """The file a chat reply names, only if it is inside the chief of staff's workspace clone."""
+    """The file a chat reply names, only if it is inside the chief of staff's workspace clone or its outbox: a path
+    relative to the workspace, /cos/workspace/… or /cos/outbox/…, or the host path of either."""
     rel = raw.strip("`'\"")
-    if rel.startswith("/cos/workspace/"):
-        rel = rel[len("/cos/workspace/"):]
-    if rel.startswith("/"):
-        raise ValueError("only paths inside the workspace")
-    base = COS_WORKSPACE.resolve()
-    f = (base / rel).resolve()
-    if not f.is_relative_to(base) or ".git" in f.relative_to(base).parts:
-        raise ValueError("outside the workspace")
+    for prefix, base in (("/cos/workspace/", COS_WORKSPACE), ("/cos/outbox/", COS_OUTBOX)):
+        if rel.startswith(prefix):
+            cand = base / rel[len(prefix):]
+            break
+    else:
+        cand = Path(rel) if rel.startswith("/") else COS_WORKSPACE / rel
+    f = cand.resolve()
+    base = next((b.resolve() for b in (COS_WORKSPACE, COS_OUTBOX) if f.is_relative_to(b.resolve())), None)
+    if base is None or ".git" in f.relative_to(base).parts:
+        raise ValueError("only files in the workspace or the outbox")
     if f.suffix.lower() not in FILE_TYPES:
         raise ValueError(f"type {f.suffix or '(none)'} not allowed")
     if not f.is_file():
         raise ValueError("no such file")
     if f.stat().st_size > ATTACH_BYTES:
-        raise ValueError("over 10 MB")
+        raise ValueError(f"over {ATTACH_BYTES // 2**20} MB, Telegram's limit for a bot")
     return f
+
+
+def prune_outbox() -> None:
+    """Files in the outbox go after OUTBOX_KEEP_DAYS, and folders left empty."""
+    cut = time.time() - OUTBOX_KEEP_DAYS * 86400
+    if not COS_OUTBOX.is_dir():
+        return
+    for p in sorted(COS_OUTBOX.rglob("*"), key=lambda q: -len(q.parts)):
+        try:
+            if p.is_file() and p.stat().st_mtime < cut:
+                p.unlink()
+            elif p.is_dir() and not any(p.iterdir()):
+                p.rmdir()
+        except OSError:
+            pass
 
 
 def tg_file(method: str, field: str, f: Path, **params) -> dict:
@@ -1402,12 +1522,13 @@ def tg_file(method: str, field: str, f: Path, **params) -> dict:
     req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             out = json.load(r)
     except urllib.error.HTTPError as e:
         out = json.loads(e.read() or b"{}")
     if not out.get("ok"):
         raise RuntimeError(f"telegram {method}: {out.get('description', out)}")
+    note_sent(method, params, out["result"])
     return out["result"]
 
 
@@ -1420,7 +1541,7 @@ def send_attachments(found: list[tuple[str, str]], chat_id=None) -> list[str]:
             continue
         try:
             f = attachment(raw)
-            photo = kind == "photo" and f.suffix.lower() in PHOTO_TYPES
+            photo = kind == "photo" and f.suffix.lower() in PHOTO_TYPES and f.stat().st_size <= PHOTO_BYTES
             tg_file("sendPhoto" if photo else "sendDocument", "photo" if photo else "document", f,
                     chat_id=chat_id or ALLOW["chat_id"], caption=f.name)
             log(f"chat: attached {f}")
@@ -1857,6 +1978,8 @@ def deliver(reply: str, target) -> None:
     notes = send_attachments(found, chat_id)
     if notes:
         safe("sendMessage", chat_id=chat_id, text="\n".join(notes))
+    if found:
+        prune_outbox()
 
 
 def chat_step(item: tuple | None) -> None:

@@ -40,7 +40,7 @@ def build(lines: list[dict], chat_name: str, days: float | None = None, *, hive_
           bot_label: str = "hive", now: dt.datetime | None = None) -> str:
     """The transcript of one chat: a day heading per day, each message with its time (UTC) and sender, and the start
     of the message it answers."""
-    now = now or dt.datetime.now(dt.UTC)
+    now = now or dt.datetime.now(dt.timezone.utc)
     since = (now - dt.timedelta(days=days)).isoformat() if days else ""
     es = [e for e in lines if e.get("chat_name") == chat_name and e.get("at", "") >= since]
     byid = {(e.get("chat"), e.get("id")): e for e in es if e.get("id") is not None}

@@ -4,7 +4,8 @@
 Deterministic, no model. It:
 - pushes each new operator inbox item (goal to approve or accept, escalation,
   pending exception) with buttons, and again as a reminder while it is still
-  waiting after --remind-hours (so an old request doesn't get buried);
+  waiting after --remind-hours (so an old request doesn't get buried). A completed
+  goal's card carries its result and what accepting it means, with its summary file;
 - turns button taps into signed record events: goal.approved, goal.accepted,
   goal.reopened (asks for the reason as a reply) and goal.abandoned; and Restart on a task
   the supervisor gave up on (repeated_failure, stuck): task.escalation_resolved "Restart:", the
@@ -206,8 +207,63 @@ def goal_text(gid: str) -> str:
     return "\n\n".join(parts)
 
 
+ACCEPT_HEAD = re.compile(r"^(#{1,6})\s*what acceptance means\s*:?\s*$", re.I)
+TITLE_MAX, OUTCOME_MAX, ACCEPT_MAX, RELEVANCE_MAX, ASKED_MAX = 200, 500, 1100, 300, 700   # the record caps the first, second and fourth
+CARD_MAX = 4000   # a Telegram message holds 4096 characters
+
+
+def completed_text(gid: str) -> tuple[str, str | None, str]:
+    """A completed goal's card: the result (the chief of staff's outcome), what accepting it means (its summary's
+    section of that name), the relevance line and, folded, what was asked. Before this the card showed only the goal,
+    so the operator had to find the summary to decide (2026-11-12). Also the summary's text and file name, sent with
+    the card as a file."""
+    ok, out = hive("goal", gid)
+    if not ok:
+        return "", None, ""
+    g = json.loads(out)
+    g = g.get("goal", g)
+    pin = g.get("summary") or {}
+    summary = result_text(pin)
+    accept = md_section(summary or "", ACCEPT_HEAD)
+    title = f"<b>{esc(cut(g.get('title', gid), TITLE_MAX))}</b>"
+    result = f"<b>Result:</b> {esc(cut(g['outcome'], OUTCOME_MAX))}" if g.get("outcome") else ""
+    if_accept = f"<b>If you accept:</b>\n{md_html(cut(accept, ACCEPT_MAX))}" if accept else ""
+    relevance = (f"<i>Doesn't count, even if every check passes, when:</i> {esc(cut(g['relevance'], RELEVANCE_MAX))}"
+                 if g.get("relevance") else "")
+    where = ("The full summary (the answer, what was found, what's open) is in the file below." if summary
+             else f"<i>The summary <code>{esc(pin.get('path', '?'))}</code> couldn't be read here.</i>" if pin else "")
+    asked = (f"<b>What was asked:</b><blockquote expandable>{esc(cut(g['objective'], ASKED_MAX))}</blockquote>"
+             if g.get("objective") else "")
+    # Too long for one message (with room for the head and the footer): the folded objective goes first, then the
+    # acceptance section; both are in the file.
+    for drop in ((), (asked,), (asked, if_accept)):
+        text = "\n\n".join(p for p in (title, result, if_accept, relevance, where, asked) if p and p not in drop)
+        if len(text) <= CARD_MAX - 200:
+            break
+    return text, summary, Path(pin.get("path") or f"{gid}-summary.md").name
+
+
+def md_html(s: str) -> str:
+    """A summary's markdown as Telegram HTML: escaped, with **bold** and `code` kept; other markup stays as it is."""
+    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", esc(s))
+    return re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", s)
+
+
 def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_card(text: str, kb: list) -> dict:
+    """An inbox card. If Telegram can't parse its HTML, it goes as plain text, so a decision is never lost to markup."""
+    extra = {"reply_markup": {"inline_keyboard": kb}} if kb else {}
+    try:
+        return tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML", **extra)
+    except RuntimeError as e:
+        if "parse" not in str(e).lower():
+            raise
+        log(f"card sent as plain text: {e}")
+        plain = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        return tg("sendMessage", chat_id=ALLOW["chat_id"], text=plain, **extra)
 
 
 def buttons(item: dict) -> list:
@@ -297,13 +353,26 @@ def push_inbox(st: dict) -> None:
             continue
         reminder = item["key"] in st["notified"]
         text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
-        text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
+        summary, name = None, ""
+        if item["kind"] == "goal_completed":
+            body, summary, name = completed_text(item["id"])
+            text += body
+        else:
+            text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
         if question:
             text += question_text(item["id"])
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
         kb = buttons(item) or budget_kb(item)
-        tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML",
-           **({"reply_markup": {"inline_keyboard": kb}} if kb else {}))
+        card_msg = send_card(text, kb)
+        if summary:   # the summary itself, under the card: the decision's evidence one tap away
+            try:
+                f = STATE.parent / "goals" / name
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(summary)
+                tg_file("sendDocument", "document", f, chat_id=ALLOW["chat_id"], caption=f"{item['id']}: the goal summary",
+                        reply_to_message_id=card_msg["message_id"], allow_sending_without_reply="true")
+            except Exception as e:
+                log(f"summary of {item['id']} not sent: {e}")
         if not reminder:
             st["notified"].append(item["key"])
         sent_at[item["key"]] = now
@@ -714,9 +783,11 @@ def on_callback(cq: dict, st: dict) -> None:
     st["decided"] = (st["decided"] + [key])[-200:]
     save_state(st)
     status = f"\n\n{'✅' if ok else '❌'} {info}"
-    # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice.
+    # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice. The card's
+    # formatting (entities) is kept; the status goes after it, so their offsets still hold.
     if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
-            text=(msg.get("text") or "") + status) is None:
+            text=(msg.get("text") or "") + status,
+            **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
         safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
              reply_markup={"inline_keyboard": []})
         safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
@@ -1769,12 +1840,12 @@ def cut(text: str, n: int) -> str:
     return head.rstrip() + "…"
 
 
-def report_summary(text: str) -> tuple[str, bool]:
-    """A result report's "## Summary" section (any heading level), up to the next heading at its level or
-    above, and True; a report without one gives its first ~800 characters and False."""
+def md_section(text: str, head: re.Pattern) -> str:
+    """The first non-empty markdown section whose heading matches `head` (any level), up to the next heading at its
+    level or above; "" if none."""
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        m = SUMMARY_HEAD.match(line.strip())
+        m = head.match(line.strip())
         if not m:
             continue
         body = []
@@ -1785,8 +1856,15 @@ def report_summary(text: str) -> tuple[str, bool]:
             body.append(nxt)
         found = "\n".join(body).strip()
         if found:
-            return cut(found, SUMMARY_MAX), True
-    return cut(text.strip(), FALLBACK_CHARS), False
+            return found
+    return ""
+
+
+def report_summary(text: str) -> tuple[str, bool]:
+    """A result report's "## Summary" section (any heading level), up to the next heading at its level or
+    above, and True; a report without one gives its first ~800 characters and False."""
+    found = md_section(text, SUMMARY_HEAD)
+    return (cut(found, SUMMARY_MAX), True) if found else (cut(text.strip(), FALLBACK_CHARS), False)
 
 
 def send_result(task: str, origin: dict) -> None:

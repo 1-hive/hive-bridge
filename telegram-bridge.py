@@ -192,7 +192,47 @@ def save_state(st: dict) -> None:
     tmp.replace(STATE)
 
 
-def goal_text(gid: str) -> str:
+INPUTS_BLOCK = re.compile(r"^```hive-inputs[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
+INPUT_WHY_MAX = 120
+SHOWN_INPUTS: dict[str, list] = {}   # goal -> the host inputs its card was last built with
+
+
+def goal_inputs(g: dict) -> tuple[list[list[str]], str | None]:
+    """The host inputs the goal's current document declares (hive-runtime inputs.py: a hive-inputs block of `path why`
+    lines), and a problem with the block if any. Approving the goal grants them to its tasks; the launcher checks
+    the paths."""
+    pin = g.get("goal_pin") or {}
+    if not pin:
+        return [], None
+    text = result_text(pin)
+    if text is None:
+        return [], f"the goal document {pin.get('path', '?')} couldn't be read here"
+    blocks = INPUTS_BLOCK.findall(text)
+    if not blocks:
+        return [], ("its hive-inputs block isn't closed" if re.search(r"^```hive-inputs", text, re.M) else None)
+    if len(blocks) > 1:
+        return [], "it has more than one hive-inputs block"
+    out = []
+    for line in blocks[0].splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            path, why = (re.split(r"\s+", line, maxsplit=1) + [""])[:2]
+            out.append([path, why.strip()])
+    return out, None
+
+
+def inputs_html(inputs: list, problem: str | None) -> str:
+    parts = []
+    if inputs:
+        parts.append("🔓 <b>Approving lets its agents read these host files</b> (read-only copies):\n"
+                     + "\n".join(f"• <code>{esc(p)}</code>: {esc(cut(w, INPUT_WHY_MAX))}" for p, w in inputs))
+    if problem:
+        parts.append(f"⚠️ <i>Its host inputs can't be read ({esc(problem)}): its tasks won't launch until the chief "
+                     "of staff fixes the goal document.</i>")
+    return "\n\n".join(parts)
+
+
+def goal_text(gid: str, with_inputs: bool = False) -> str:
     ok, out = hive("goal", gid)
     if not ok:
         return ""
@@ -204,7 +244,32 @@ def goal_text(gid: str) -> str:
     if g.get("relevance"):
         # The goal's relevance line: how the work could pass every check and still miss the point.
         parts.append(f"<i>Doesn't count, even if every check passes, when:</i> {esc(g['relevance'])}")
+    if with_inputs:
+        inputs, problem = goal_inputs(g)
+        SHOWN_INPUTS[gid] = inputs
+        if inputs or problem:
+            parts.append(inputs_html(inputs, problem))
     return "\n\n".join(parts)
+
+
+def remember_inputs(st: dict, message: dict | None, gid: str) -> None:
+    """Which host inputs this approval card showed, so a tap on it can't approve others (a revision since)."""
+    if message and "message_id" in message:
+        shown = st.setdefault("inputs_shown", {})
+        shown[str(message["message_id"])] = SHOWN_INPUTS.get(gid, [])
+        for k in list(shown)[:-200]:
+            del shown[k]
+
+
+def inputs_changed(st: dict, message_id, gid: str) -> bool:
+    """Approve tapped on a card: do the goal's host inputs now differ from what that card showed? A card from before
+    this check (none recorded) counts as having shown none."""
+    ok, out = hive("goal", gid)
+    if not ok:
+        return False   # the approval itself will report the problem
+    g = json.loads(out)
+    now, _ = goal_inputs(g.get("goal", g))
+    return now != (st.get("inputs_shown") or {}).get(str(message_id), [])
 
 
 ACCEPT_HEAD = re.compile(r"^(#{1,6})\s*what acceptance means\s*:?\s*$", re.I)
@@ -358,12 +423,15 @@ def push_inbox(st: dict) -> None:
             body, summary, name = completed_text(item["id"])
             text += body
         else:
-            text += goal_text(item["id"]) if item["entity"] == "goal" else f"<b>{esc(item['title'])}</b>"
+            text += (goal_text(item["id"], item["kind"] == "goal_proposed") if item["entity"] == "goal"
+                     else f"<b>{esc(item['title'])}</b>")
         if question:
             text += question_text(item["id"])
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
         kb = buttons(item) or budget_kb(item)
         card_msg = send_card(text, kb)
+        if item["kind"] == "goal_proposed":
+            remember_inputs(st, card_msg, item["id"])
         if summary:   # the summary itself, under the card: the decision's evidence one tap away
             try:
                 f = STATE.parent / "goals" / name
@@ -776,6 +844,18 @@ def on_callback(cq: dict, st: dict) -> None:
         return
     if not etype:
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
+        return
+    if action == "approve" and inputs_changed(st, msg.get("message_id"), gid):
+        # Approving grants the host inputs the goal declares now (hive-runtime inputs.py), and this card showed
+        # others: not approved; the current card goes out instead, to tap there.
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="its host inputs changed: see the new card")
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg.get("message_id"),
+             reply_markup={"inline_keyboard": []})
+        text = (f"{HEAD['goal_proposed']}\n\n<i>Not approved: its host inputs changed since the card you tapped. "
+                f"This is the current goal.</i>\n\n{goal_text(gid, True)}\n\n<code>goal {gid}</code>")
+        remember_inputs(st, send_card(text, buttons({"kind": "goal_proposed", "id": gid})), gid)
+        save_state(st)
+        log(f"approve {gid}: refused, host inputs changed since card {msg.get('message_id')}")
         return
     safe("answerCallbackQuery", callback_query_id=cq["id"])
     ok, info = emit(etype, gid)

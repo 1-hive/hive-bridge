@@ -12,6 +12,23 @@ Where humans meet a hive: a chat bridge (Telegram first) and the Floor, a read-o
 
 Related: [hive-record](https://github.com/1-hive/hive-record) (R1 + R2), [hive-runtime](https://github.com/1-hive/hive-runtime) (the operating loop), [hive-route](https://github.com/1-hive/hive-route) (R8).
 
+## Taps only where they decide something
+
+- **A goal you asked for starts on its own.** The bridge logs what operators write to the chief of staff
+  (`.telegram/operator-words.jsonl`; hive-runtime's `op chat` adds the host session's). A proposed goal whose
+  `hive-request` block quotes those words (3+ words, in order, from the last 14 days) and that asks for no host inputs is
+  approved by the bridge; its card shows the words and **⏹ Stop**, which abandons it and tells the chief of staff to
+  cancel its tasks. Anything else (the chief of staff's own idea, host files) gets the Approve card. `HIVE_AUTO_START=0`
+  turns it off.
+- **A completed goal with nothing to merge accepts itself** after `HIVE_AUTO_ACCEPT_DAYS` (3; 0 turns it off), with
+  ↩ Reopen on its card and no reminders. With code to merge, ✅ Accept + merge as before.
+- **🔀 Merge on a published pull request** (proto-hive's staged repositories): `telegram-say.py` gives the publisher's
+  PR message a button when `HIVE_PR`/`HIVE_PR_SHA` are set and keeps the PR in `.telegram/prs.json`; any operator's tap
+  runs `HIVE_PR_MERGE_CMD URL SHA` (proto-hive: `deploy/merge-pr`, i.e. hive-runtime's `publisher.py --merge-pr` as
+  root), which merges with a merge commit only while the PR's head is still the reviewed commit.
+
+Test: `tests/asking_is_approving_test.py`.
+
 ## Configuration
 
 `hive_paths.py` reads the same environment variables as [hive-runtime](https://github.com/1-hive/hive-runtime), with the same defaults (1-hive's layout): `HIVE_ID`, `HIVE_GATEWAY_PORT`, `HIVE_URL`, `HIVE_CONFIG_DIR` (`telegram-token`, `telegram.json`, `telegram-bridge.key`, `floor.key`), `HIVE_WORK_DIR` (the bridge's state in `.telegram/`, the chief of staff's follow-ups and workspace in `cos/`) and `HIVE_WORKSPACE_REPO`. The chat with the chief of staff is the command in `TELEGRAM_CHAT_CMD` (hive-runtime's `cos.sh chat`).

@@ -502,6 +502,202 @@ def on_merge(cq: dict, st: dict, msg: dict, action: str, gid: str, key: str) -> 
                   "new main. No reply needed.", False, None))
 
 
+# Asking is approving (2026-11-16): taps only where they decide something. A goal the chief of staff proposes because an
+# operator asked for it quotes their words in a `hive-request` block; when those words are in what an operator really
+# wrote in the last REQUEST_DAYS days (OPERATOR_WORDS: this bridge logs operators' Telegram messages, hive-runtime's
+# `op chat` the host session's; agents can't write there) and the goal asks for no host inputs, the bridge approves it
+# itself and its card offers ⏹ Stop (abandon) instead of Approve. A goal of the chief of staff's own initiative, or one
+# asking for host files, still waits for the Approve tap. HIVE_AUTO_START=0 turns this off.
+# And a completed goal with nothing to merge (merge.py) gets a card with ↩ Reopen only: it accepts itself after
+# HIVE_AUTO_ACCEPT_DAYS (3; 0 turns this off), without reminders. One with code to merge keeps ✅ Accept + merge.
+OPERATOR_WORDS = STATE.parent / "operator-words.jsonl"
+REQUEST_BLOCK = re.compile(r"^```hive-request[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
+AUTO_START = os.environ.get("HIVE_AUTO_START", "1") != "0"
+REQUEST_DAYS, REQUEST_MIN_WORDS, REQUEST_SHOW = 14, 3, 600
+AUTO_ACCEPT_DAYS = float(os.environ.get("HIVE_AUTO_ACCEPT_DAYS", "3") or 0)
+STOP_REASON = "Stopped by the operator (⏹ Stop in Telegram) after it started on their request"
+
+
+def note_words(frm: dict, text: str, via: str) -> None:
+    """An operator's message as they wrote it, for the hive-request check."""
+    if not (text or "").strip() or not is_operator(frm.get("id")):
+        return
+    try:
+        OPERATOR_WORDS.parent.mkdir(parents=True, exist_ok=True)
+        with OPERATOR_WORDS.open("a") as f:
+            f.write(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "via": via,
+                                "from": sender_name(frm), "text": text}) + "\n")
+    except OSError as e:
+        log(f"operator words: {e}")
+
+
+def words(s: str) -> str:
+    """Words only, lower case: quotes, punctuation, case and line breaks don't decide a match."""
+    return " ".join(re.findall(r"[\w']+", (s or "").casefold()))
+
+
+def goal_request(g: dict) -> str | None:
+    """The operator's words the goal document quotes (its one hive-request block), or None."""
+    pin = g.get("goal_pin") or {}
+    blocks = REQUEST_BLOCK.findall((result_text(pin) if pin else None) or "")
+    if len(blocks) != 1:
+        return None
+    return " ".join(x.strip() for x in blocks[0].splitlines() if x.strip() and not x.strip().startswith("#")) or None
+
+
+def said(quote: str, now: float | None = None) -> dict | None:
+    """The latest operator message of the last REQUEST_DAYS days holding the quote's words, in order and together."""
+    q = words(quote)
+    if len(q.split()) < REQUEST_MIN_WORDS:
+        return None
+    since, found = (now or time.time()) - REQUEST_DAYS * 86400, None
+    try:
+        lines = OPERATOR_WORDS.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            e = json.loads(line)
+            at = dt.datetime.fromisoformat(e["at"]).timestamp()
+        except (ValueError, KeyError, TypeError):
+            continue
+        if at >= since and f" {q} " in f" {words(e.get('text', ''))} ":
+            found = e
+    return found
+
+
+def auto_start(gid: str) -> tuple[str, dict, str] | None:
+    """Approve a proposed goal on an operator's own words (above): (the quote, their message, what was recorded), or
+    None for the usual Approve card."""
+    if not AUTO_START:
+        return None
+    ok, out = hive("goal", gid)
+    if not ok:
+        return None
+    g = json.loads(out)
+    g = g.get("goal", g)
+    quote = goal_request(g) if g.get("status") == "proposed" else None
+    if not quote:
+        return None
+    inputs, problem = goal_inputs(g)
+    if inputs or problem:
+        log(f"auto-start {gid}: no, it asks for host inputs")
+        return None
+    e = said(quote)
+    if not e:
+        log(f"auto-start {gid}: no, its hive-request isn't in the operators' words of the last {REQUEST_DAYS} days")
+        return None
+    ok, info = emit("goal.approved", gid)
+    log(f"auto-start {gid}: {info}")
+    return (quote, e, info) if ok else None
+
+
+def started_text(gid: str, quote: str, e: dict, info: str) -> str:
+    at = dt.datetime.fromisoformat(e["at"]).astimezone().strftime("%a %d %b %H:%M")
+    return (f"▶️ Goal started: you asked for it\n\n{goal_text(gid)}\n\n"
+            f"<b>Asked by {esc(e.get('from') or 'an operator')}</b> ({esc(e.get('via') or '?')}, {at}):"
+            f"<blockquote>{esc(cut(quote, REQUEST_SHOW))}</blockquote>\n"
+            f"<i>Approved on those words, no tap needed ({esc(info)}). Not what you meant? ⏹ Stop abandons it.</i>")
+
+
+def stop_goal(cq: dict, st: dict, msg: dict, gid: str, key: str) -> None:
+    """⏹ Stop on a goal that started on an operator's words: abandon it, and tell the chief of staff to cancel its tasks."""
+    safe("answerCallbackQuery", callback_query_id=cq["id"])
+    ok, info = emit("goal.abandoned", gid, {"reason": STOP_REASON})
+    log(f"stop {gid}: {info}")
+    st["decided"] = (st["decided"] + [key])[-200:]
+    if ok:
+        st.setdefault("stopped", {})[gid] = time.time()
+    save_state(st)
+    status = f"\n\n{'⏹' if ok else '❌'} {info}"
+    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"], text=(msg.get("text") or "") + status,
+            **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"], reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
+    if ok and CHAT_CMD:
+        CHAT.put((CHAT_CMD, f"The operator tapped ⏹ Stop on goal {gid}, which had started on their request: it is "
+                  f"abandoned ({info}). Cancel its open tasks (task.cancelled) and stop work on it. Reply in one line.",
+                  False, None))
+
+
+def quiet(plan: dict | None) -> bool:
+    """A completed goal that only needs closing: merge.py planned it, and there's nothing to merge and no conflict."""
+    return bool(AUTO_ACCEPT_DAYS and plan and plan.get("nothing") and not plan.get("problems"))
+
+
+def accepts_on(first: float) -> str:
+    return dt.datetime.fromtimestamp(first + AUTO_ACCEPT_DAYS * 86400).strftime("%a %d %b, %H:%M")
+
+
+def auto_accept(item: dict, st: dict) -> None:
+    gid = item["id"]
+    ok, info = emit("goal.accepted", gid, {"note": f"Accepted on its own: {AUTO_ACCEPT_DAYS:g} days without a reopen, "
+                                                   "and no code to merge (Telegram bridge)."})
+    log(f"auto-accept {gid}: {info}")
+    if ok:
+        st.get("completed_seen", {}).pop(item["key"], None)
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"✅ Goal {gid} accepted on its own: {AUTO_ACCEPT_DAYS:g} days "
+             f"without a reopen, and nothing to merge ({info}).")
+    else:
+        st.setdefault("auto_accept_failed", {})[item["key"]] = time.time()
+
+
+# Pull requests on GitHub homes (proto-hive's staged repositories). hive-runtime's publisher posts each pull request it
+# opens through telegram-say.py, with a 🔀 Merge button (callback prmerge:<key>; telegram-say.py keeps each key's PR,
+# reviewed commit, task and messages in PRS). Any operator may tap, wherever it was posted: PR_MERGE_CMD URL SHA
+# (proto-hive's deploy/merge-pr, i.e. publisher.py --merge-pr as root, for the GitHub token) merges it with a merge
+# commit, and only while its head is still the reviewed commit. Off unless HIVE_PR_MERGE_CMD is set.
+PR_MERGE_CMD = os.environ.get("HIVE_PR_MERGE_CMD", "")
+PRS = STATE.parent / "prs.json"
+
+
+def on_pr_merge(cq: dict, st: dict, k: str) -> None:
+    frm, msg = cq.get("from") or {}, cq.get("message") or {}
+    chat, mid = (msg.get("chat") or {}).get("id"), msg.get("message_id")
+    if not is_operator(frm.get("id")):
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="only an operator can merge")
+        log(f"refused PR merge tap from {frm.get('id')}")
+        return
+    try:
+        pr = json.loads(PRS.read_text()).get(k)
+    except (OSError, ValueError):
+        pr = None
+    if not PR_MERGE_CMD or not pr:
+        safe("answerCallbackQuery", callback_query_id=cq["id"],
+             text="merging isn't set up here" if not PR_MERGE_CMD else "unknown pull request")
+        return
+    done = st.setdefault("prs_merged", {})
+    if k in done:
+        safe("answerCallbackQuery", callback_query_id=cq["id"], text="already merged")
+        return
+    who = sender_name(frm)
+    safe("answerCallbackQuery", callback_query_id=cq["id"], text="merging…")
+    try:
+        r = subprocess.run([*PR_MERGE_CMD.split(), pr["url"], pr["sha"]], capture_output=True, text=True, timeout=120)
+        out = json.loads(((r.stdout or "").strip().splitlines() or ["{}"])[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        out = {"ok": False, "why": f"couldn't run the merge: {e}"}
+    reply = {"reply_to_message_id": mid, "allow_sending_without_reply": "true", "disable_web_page_preview": "true"}
+    if not (out.get("ok") or out.get("already")):
+        log(f"PR merge {pr['url']} ({who}): not merged: {out.get('why')}")
+        safe("sendMessage", chat_id=chat, text=f"❌ Not merged ({who} tapped): {out.get('why') or 'no reason given'}", **reply)
+        return
+    done[k] = {"by": who, "at": time.time(), "sha": out.get("merged_sha")}
+    for old in sorted(done, key=lambda x: done[x]["at"])[:-300]:
+        del done[old]
+    save_state(st)
+    for c, m in {(c, m) for c, m in pr.get("messages") or []} | {(chat, mid)}:   # every copy of the message
+        safe("editMessageReplyMarkup", chat_id=c, message_id=m, reply_markup={"inline_keyboard": []})
+    line = (f"🔀 Merged by {who} into {out.get('base') or 'its base branch'} (merge commit "
+            f"{str(out.get('merged_sha'))[:10]}): {pr['url']}" if out.get("ok") else f"🔀 Already merged: {pr['url']}")
+    safe("sendMessage", chat_id=chat, text=line, **reply)
+    log(f"PR merge {pr['url']} ({who}): {line}")
+    if out.get("ok") and CHAT_CMD:
+        CHAT.put((CHAT_CMD, f"{who} (operator) merged the pull request of task {pr.get('task') or '?'} on GitHub: "
+                  f"{pr['url']}, into {out.get('base')} (merge commit {out.get('merged_sha')}). The hive copy's main "
+                  "follows it within minutes, and new work branches from there. No reply needed.", False, None))
+
+
 def budget_kb(item: dict) -> list:
     if item["kind"] == "escalation_open" and item["entity"] == "goal" and item["title"].startswith("budget_exceeded"):
         return [[{"text": "⏱ +4h", "callback_data": f"budget:{item['id']}:4"}]]
@@ -571,15 +767,43 @@ def push_inbox(st: dict) -> None:
         return
     sent_at = st.setdefault("notified_at", {})
     now = time.time()
-    for item in json.loads(out) + waiting_questions(st, now):
+    items = json.loads(out)
+    seen = st.setdefault("completed_seen", {})   # a completed goal's first card: when it accepts itself (quiet())
+    for k in [k for k in seen if k not in {i["key"] for i in items}]:
+        del seen[k]                              # accepted, reopened or abandoned since
+    stopped = {g: t for g, t in (st.get("stopped") or {}).items() if now - t < 3600}
+    st["stopped"] = stopped
+    for item in items + waiting_questions(st, now):
         question = item["kind"] == "task_blocked_unanswered_any"
-        # Sent before (and recently): skip. Sent long ago, or before sent_at existed: remind.
-        if item["key"] in st["notified"] and now - sent_at.get(item["key"], 0) < (QUESTION_REMIND_S if question else REMIND_S):
+        if item["kind"] == "goal_abandoned_open_tasks" and item["id"] in stopped:
+            continue   # just stopped with ⏹: the chief of staff is cancelling its tasks
+        plan = merge_plan(item["id"]) if item["kind"] == "goal_completed" else None
+        closing = item["kind"] == "goal_completed" and quiet(plan)
+        if closing:
+            first = seen.setdefault(item["key"], now)
+            if now - first >= AUTO_ACCEPT_DAYS * 86400:
+                if now - (st.get("auto_accept_failed") or {}).get(item["key"], 0) >= 3600:
+                    auto_accept(item, st)
+                    save_state(st)
+                continue
+        # Sent before (and recently): skip. Sent long ago, or before sent_at existed: remind (never a goal that
+        # accepts itself).
+        if item["key"] in st["notified"] and (closing or now - sent_at.get(item["key"], 0) < (QUESTION_REMIND_S if question else REMIND_S)):
             continue
         reminder = item["key"] in st["notified"]
-        text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
+        if item["kind"] == "goal_proposed" and not reminder:
+            got = auto_start(item["id"])
+            if got:
+                send_card(started_text(item["id"], *got) + f"\n\n<code>goal {item['id']} · @{item['position']}</code>",
+                          [[{"text": "⏹ Stop", "callback_data": f"stop:{item['id']}"}]])
+                st["notified"].append(item["key"])
+                sent_at[item["key"]] = now
+                save_state(st)
+                log(f"started {item['key']} on the operator's words")
+                continue
+        text = ("⏰ Still waiting for you.\n\n" if reminder else "") + \
+            f"{'🏁 Goal completed' if closing else HEAD.get(item['kind'], item['kind'])}\n\n"
         summary, name = None, ""
-        plan = merge_plan(item["id"]) if item["kind"] == "goal_completed" else None
         if item["kind"] == "goal_completed":
             body, summary, name = completed_text(item["id"], plan)
             text += body
@@ -588,8 +812,12 @@ def push_inbox(st: dict) -> None:
                      else f"<b>{esc(item['title'])}</b>")
         if question:
             text += question_text(item["id"])
+        if closing:
+            text += (f"\n\n⏳ <b>Nothing to merge, nothing to do: it accepts itself on {accepts_on(seen[item['key']])}</b>"
+                     " unless you reopen it.")
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
-        kb = buttons(item, plan) or budget_kb(item)
+        kb = ([[{"text": "↩ Reopen", "callback_data": f"reopen:{item['id']}"}]] if closing
+              else buttons(item, plan) or budget_kb(item))
         card_msg = send_card(text, kb)
         if item["kind"] == "goal_proposed":
             remember_inputs(st, card_msg, item["id"])
@@ -967,6 +1195,8 @@ def on_callback(cq: dict, st: dict) -> None:
         return on_repo_callback(cq, st, act, rest)
     if act == "dq":                     # a decision card's answer button, in any chat (on_decision_callback)
         return on_decision_callback(cq, st)
+    if act == "prmerge":                # a published pull request's 🔀 Merge, in any chat: any operator (on_pr_merge)
+        return on_pr_merge(cq, st, rest)
     if not allowed(cq.get("from") or {}, msg.get("chat") or {}):
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="not allowed")
         log(f"refused callback from {cq.get('from', {}).get('id')}")
@@ -985,6 +1215,8 @@ def on_callback(cq: dict, st: dict) -> None:
         return
     if action in ("acceptmerge", "merge"):
         return on_merge(cq, st, msg, action, gid, key)
+    if action == "stop":
+        return stop_goal(cq, st, msg, gid, key)
     etype = {"approve": "goal.approved", "accept": "goal.accepted"}.get(action)
     if action == "budget":
         gid, _, hours = gid.rpartition(":")
@@ -1190,6 +1422,8 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
                             "reply_to": env.get("reply_to", {}).get("from"), "at": env["message"]["at"]}) + "\n")
     if not chat_cmd:
         return
+    if not is_bot:
+        note_words(frm, text, f"Telegram, {env['chat']['name']}")
     if CHAT.unfinished_tasks:
         safe("sendMessage", chat_id=chat["id"], text="(queued: the chief of staff is on another message)",
              reply_to_message_id=m["message_id"])
@@ -1232,8 +1466,10 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         return
     if text in ("/start", "/help"):
         tg("sendMessage", chat_id=ALLOW["chat_id"],
-           text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
-                "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
+           text=f"{hp.HIVE_ID}: I'll message you when a goal needs you (approval, a merge), or something escalates, "
+                "and send a digest every day. A goal you asked for starts on its own (⏹ Stop if it isn't what you "
+                "meant); one with nothing to merge accepts itself after a few days (↩ Reopen to send it back). "
+                "Use the buttons to decide. /inbox lists what's waiting; "
                 "/digest sends the digest now; /merge <goal> merges an accepted goal's reviewed code into main "
                 "(/merge alone lists what's waiting); /board shows what each agent is doing"
                 + ("; /floor opens the Floor." if FLOOR_PUBLIC else "."))
@@ -1251,6 +1487,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if chat_cmd:
         if CHAT.unfinished_tasks:
             safe("sendMessage", chat_id=ALLOW["chat_id"], text="(queued: the chief of staff is still on your last message)")
+        note_words(frm, text, "Telegram")
         CHAT.put((chat_cmd, text + files_block(files_of(m)), True, None))
     else:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
@@ -1271,6 +1508,7 @@ def other_operator(m: dict, frm: dict, chat: dict, text: str, chat_cmd: str | No
         return
     if CHAT.unfinished_tasks:
         safe("sendMessage", chat_id=chat["id"], text="(queued: the chief of staff is on another message)")
+    note_words(frm, text, "Telegram, private")
     CHAT.put((chat_cmd, f"A private message to you from {who}, an operator of the hive. Your reply goes back to "
               f"{who} in that private chat.\n\n{text}{files_block(files_of(m))}", True, {"chat_id": chat["id"], "reply_to": m["message_id"]}))
     log(f"private message from operator {who} to the chief of staff")

@@ -115,7 +115,8 @@ cm, cn, cc = cards
 assert "🔀 <b>Accept + merge</b> also puts its reviewed code into main:" in cm["text"], cm["text"]
 assert "<code>mtg-player main: fast-forward to hive/s1-2-ladder c2135f2</code>" in cm["text"], cm["text"]
 assert kb(cm) == [["acceptmerge:gm"], ["accept:gm", "reopen:gm"]], kb(cm)
-assert "🔀" not in cn["text"] and kb(cn) == [["accept:gn", "reopen:gn"]], (cn["text"], kb(cn))
+# Nothing to merge: no Accept to tap, it accepts itself in a few days (asking_is_approving_test.py has the rest).
+assert "🔀" not in cn["text"] and "accepts itself on" in cn["text"] and kb(cn) == [["reopen:gn"]], (cn["text"], kb(cn))
 assert "isn't merged from here" in cc["text"] and "conflicts in a.txt" in cc["text"] and "merge task" in cc["text"]
 assert kb(cc) == [["accept:gc", "reopen:gc"]], kb(cc)
 assert st["merge_shown"] == {"101": "d1", "102": None, "103": None}, st["merge_shown"]

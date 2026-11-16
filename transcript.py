@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-COMMANDS = ("/board", "/floor", "/start", "/help", "/digest", "/inbox")
+COMMANDS = ("/board", "/floor", "/start", "/help", "/digest", "/inbox", "/merge")
 
 
 def read(path: Path) -> list[dict]:

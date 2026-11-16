@@ -277,7 +277,7 @@ TITLE_MAX, OUTCOME_MAX, ACCEPT_MAX, RELEVANCE_MAX, ASKED_MAX = 200, 500, 1100, 3
 CARD_MAX = 4000   # a Telegram message holds 4096 characters
 
 
-def completed_text(gid: str) -> tuple[str, str | None, str]:
+def completed_text(gid: str, plan: dict | None = None) -> tuple[str, str | None, str]:
     """A completed goal's card: the result (the chief of staff's outcome), what accepting it means (its summary's
     section of that name), the relevance line and, folded, what was asked. Before this the card showed only the goal,
     so the operator had to find the summary to decide (2026-11-12). Also the summary's text and file name, sent with
@@ -299,10 +299,11 @@ def completed_text(gid: str) -> tuple[str, str | None, str]:
              else f"<i>The summary <code>{esc(pin.get('path', '?'))}</code> couldn't be read here.</i>" if pin else "")
     asked = (f"<b>What was asked:</b><blockquote expandable>{esc(cut(g['objective'], ASKED_MAX))}</blockquote>"
              if g.get("objective") else "")
+    merge = merge_html(plan, True)   # what Accept + merge does: never dropped
     # Too long for one message (with room for the head and the footer): the folded objective goes first, then the
     # acceptance section; both are in the file.
     for drop in ((), (asked,), (asked, if_accept)):
-        text = "\n\n".join(p for p in (title, result, if_accept, relevance, where, asked) if p and p not in drop)
+        text = "\n\n".join(p for p in (title, result, if_accept, merge, relevance, where, asked) if p and p not in drop)
         if len(text) <= CARD_MAX - 200:
             break
     return text, summary, Path(pin.get("path") or f"{gid}-summary.md").name
@@ -331,15 +332,174 @@ def send_card(text: str, kb: list) -> dict:
         return tg("sendMessage", chat_id=ALLOW["chat_id"], text=plain, **extra)
 
 
-def buttons(item: dict) -> list:
+def buttons(item: dict, plan: dict | None = None) -> list:
     k, gid = item["kind"], item["id"]
     if k == "goal_proposed":
         return [[{"text": "✅ Approve", "callback_data": f"approve:{gid}"},
                  {"text": "🗑 Abandon", "callback_data": f"abandon:{gid}"}]]
     if k == "goal_completed":
+        if plan and plan.get("mergeable") and len(f"acceptmerge:{gid}".encode()) <= 64:
+            return [[{"text": "✅ Accept + merge", "callback_data": f"acceptmerge:{gid}"}],
+                    [{"text": "✅ Accept only", "callback_data": f"accept:{gid}"},
+                     {"text": "↩ Reopen", "callback_data": f"reopen:{gid}"}]]
         return [[{"text": "✅ Accept", "callback_data": f"accept:{gid}"},
                  {"text": "↩ Reopen", "callback_data": f"reopen:{gid}"}]]
     return []
+
+
+# Merging (hive-runtime merge.py). Agents can't push a code repository's main (merging is decided after review), so
+# the operator merged each accepted goal's code by hand. Now a completed goal's card says what its reviewed code would
+# put into main, and ✅ Accept + merge merges exactly that (the plan's digest, as the card showed it), then accepts.
+# /merge <goal> does the same for a goal accepted already. A conflict is found when planning: the card says so and
+# offers only Accept. HIVE_MERGE_PY names merge.py; by default it's hive-runtime's, installed beside this bridge.
+MERGE_PY = os.environ.get("HIVE_MERGE_PY")
+if MERGE_PY is None:
+    _m = Path(__file__).resolve().parent.parent / "hive-runtime" / "merge.py"
+    MERGE_PY = str(_m) if _m.is_file() else ""
+MERGE_LINES_MAX = 12
+
+
+def merge_plan(gid: str) -> dict | None:
+    """merge.py's plan for the goal, or None: merging isn't set up, or planning failed (logged)."""
+    if not MERGE_PY:
+        return None
+    try:
+        r = subprocess.run(["python3", MERGE_PY, "plan", gid, "--json"], capture_output=True, text=True, env=ENV,
+                           timeout=180)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        log(f"merge plan {gid}: {(r.stderr or r.stdout).strip()[-300:]}")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log(f"merge plan {gid}: {e}")
+    return None
+
+
+def run_merge(gid: str, digest: str, via: str) -> tuple[bool, dict | str]:
+    """Merge exactly the plan with this digest: (True, merge.py's outcome) or (False, why not)."""
+    try:
+        r = subprocess.run(["python3", MERGE_PY, "run", gid, "--digest", digest, "--via", via], capture_output=True,
+                           text=True, env=ENV, timeout=600)
+        o = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return False, f"merge.py failed: {e}"
+    if o.get("refused"):
+        return False, o["refused"]
+    return (True, o) if o.get("ok") else (False, o.get("line") or "not merged")
+
+
+def merge_html(p: dict | None, accepting: bool) -> str:
+    """The card's merge section: what the merge button puts into main, or why its code isn't merged from here."""
+    if not p or not (p.get("lines") or p.get("problems")):
+        return ""
+    lines = p.get("lines") or []
+    shown = "\n".join(f"• <code>{esc(x.strip())}</code>" for x in lines[:MERGE_LINES_MAX])
+    if len(lines) > MERGE_LINES_MAX:
+        shown += f"\n…and {len(lines) - MERGE_LINES_MAX} more"
+    if p.get("mergeable"):
+        head = ("🔀 <b>Accept + merge</b> also puts its reviewed code into main:" if accepting
+                else "🔀 <b>Merge</b> puts its reviewed code into main:")
+    else:
+        head = "🔀 <b>Its code isn't merged from here:</b>"
+    out = head + ("\n" + shown if shown else "")
+    if p.get("problems"):
+        out += ("\n⚠️ " + esc(cut("; ".join(p["problems"]), 600))
+                + "\n<i>Nothing can be merged until that's fixed: merge by hand, or ask the chief of staff for a "
+                  "merge task.</i>")
+    return out
+
+
+def remember_merge(st: dict, message: dict | None, plan: dict | None) -> None:
+    """Which plan this card showed (its digest, or None if it offered no merge), so a tap merges only that."""
+    if message and "message_id" in message:
+        shown = st.setdefault("merge_shown", {})
+        shown[str(message["message_id"])] = plan["digest"] if plan and plan.get("mergeable") else None
+        for k in list(shown)[:-200]:
+            del shown[k]
+
+
+def merge_card(gid: str, p: dict, changed: bool = False) -> tuple[str, list]:
+    note = ("<i>Not merged: what would be merged changed since the card you tapped. This is the current plan.</i>\n\n"
+            if changed else "")
+    body = merge_html(p, False) or "Nothing to merge: its reviewed code is already in main, or it changed no code."
+    text = (f"{note}🔀 <b>Merge goal {esc(gid)}</b> ({esc(p.get('status') or '?')}): {esc(cut(p.get('title') or '', 200))}"
+            f"\n\n{body}\n\n<code>goal {esc(gid)} · plan {esc(p['digest'])}</code>")
+    kb = ([[{"text": "🔀 Merge", "callback_data": f"merge:{gid}"}]]
+          if p.get("mergeable") and len(f"merge:{gid}".encode()) <= 64 else [])
+    return text, kb
+
+
+def merge_command(st: dict, text: str) -> None:
+    """/merge <goal>: a merge card for that goal. /merge alone: the recent goals whose reviewed code isn't in main."""
+    args = text.split()[1:]
+    if not MERGE_PY:
+        tg("sendMessage", chat_id=ALLOW["chat_id"], text="Merging isn't set up here: hive-runtime's merge.py wasn't found.")
+        return
+    if not args:
+        ok, out = hive("state")
+        goals = [g for g in json.loads(out)["goals"].values() if g.get("status") in ("accepted", "completed")] if ok else []
+        goals.sort(key=lambda g: g.get("status_since") or 0, reverse=True)
+        ready = [g["id"] for g in goals[:12] if (merge_plan(g["id"]) or {}).get("mergeable")]
+        tg("sendMessage", chat_id=ALLOW["chat_id"], parse_mode="HTML",
+           text=("Reviewed code not in main yet:\n" + "\n".join(f"<code>/merge {esc(x)}</code>" for x in ready)) if ready
+           else "No recent goal has reviewed code waiting to be merged.")
+        return
+    p = merge_plan(args[0])
+    if not p:
+        tg("sendMessage", chat_id=ALLOW["chat_id"], text=f"❌ Couldn't plan a merge for {args[0]}: no such goal, or see the bridge's log.")
+        return
+    text, kb = merge_card(args[0], p)
+    remember_merge(st, send_card(text, kb), p)
+    save_state(st)
+
+
+def on_merge(cq: dict, st: dict, msg: dict, action: str, gid: str, key: str) -> None:
+    """✅ Accept + merge, or 🔀 Merge: merge exactly the plan the card showed, then (Accept + merge) accept the goal.
+    If the plan changed since the card (main moved, another result passed review), nothing happens and the current card
+    goes out instead. If merging fails, nothing is accepted and the card keeps its buttons."""
+    safe("answerCallbackQuery", callback_query_id=cq["id"])
+    mid = msg.get("message_id")
+    p = merge_plan(gid)
+    if not p:
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"❌ Couldn't plan the merge of {gid} (the bridge's log says "
+             "why). Nothing was merged or accepted.")
+        return
+    if p["digest"] != (st.get("merge_shown") or {}).get(str(mid)):
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=mid, reply_markup={"inline_keyboard": []})
+        if action == "acceptmerge":
+            body, _, _ = completed_text(gid, p)
+            text = (f"{HEAD['goal_completed']}\n\n<i>Not merged or accepted: what would be merged changed since the card "
+                    f"you tapped. This is the current card.</i>\n\n{body}\n\n<code>goal {esc(gid)}</code>")
+            card = send_card(text, buttons({"kind": "goal_completed", "id": gid}, p))
+        else:
+            card = send_card(*merge_card(gid, p, changed=True))
+        remember_merge(st, card, p)
+        save_state(st)
+        log(f"{action} {gid}: refused, plan changed since card {mid}")
+        return
+    ok, o = run_merge(gid, p["digest"], "Telegram: Accept + merge" if action == "acceptmerge" else "Telegram: /merge")
+    if not ok:
+        log(f"{action} {gid}: not merged: {o}")
+        safe("sendMessage", chat_id=ALLOW["chat_id"],
+             text=f"❌ Not merged{' or accepted' if action == 'acceptmerge' else ''}: {o}"
+                  + ("\nThe card's other buttons still work (Accept only accepts without merging)." if action == "acceptmerge" else ""))
+        return
+    lines = [f"🔀 Merged: {o['line']}"]
+    accepted = False
+    if action == "acceptmerge":
+        accepted, info = emit("goal.accepted", gid, {"note": cut(f"Accept + merge. Merged into main: {o['line']}", 480)})
+        lines.insert(0, f"{'✅' if accepted else '❌'} {info}")
+    log(f"{action} {gid}: {' / '.join(lines)}")
+    st["decided"] = (st["decided"] + [key])[-200:]
+    save_state(st)
+    status = "\n\n" + "\n".join(lines)
+    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=mid, text=(msg.get("text") or "") + status,
+            **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
+        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=mid, reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
+    if CHAT_CMD:
+        CHAT.put((CHAT_CMD, f"The operator {'accepted goal ' + gid + ' and ' if accepted else ''}merged goal {gid}'s "
+                  f"reviewed code into main ({o['line']}). Nothing is left to merge for it; new work branches from the "
+                  "new main. No reply needed.", False, None))
 
 
 def budget_kb(item: dict) -> list:
@@ -419,8 +579,9 @@ def push_inbox(st: dict) -> None:
         reminder = item["key"] in st["notified"]
         text = ("⏰ Still waiting for you.\n\n" if reminder else "") + f"{HEAD.get(item['kind'], item['kind'])}\n\n"
         summary, name = None, ""
+        plan = merge_plan(item["id"]) if item["kind"] == "goal_completed" else None
         if item["kind"] == "goal_completed":
-            body, summary, name = completed_text(item["id"])
+            body, summary, name = completed_text(item["id"], plan)
             text += body
         else:
             text += (goal_text(item["id"], item["kind"] == "goal_proposed") if item["entity"] == "goal"
@@ -428,10 +589,12 @@ def push_inbox(st: dict) -> None:
         if question:
             text += question_text(item["id"])
         text += f"\n\n<code>{item['entity']} {item['id']} · @{item['position']}</code>"
-        kb = buttons(item) or budget_kb(item)
+        kb = buttons(item, plan) or budget_kb(item)
         card_msg = send_card(text, kb)
         if item["kind"] == "goal_proposed":
             remember_inputs(st, card_msg, item["id"])
+        if item["kind"] == "goal_completed":
+            remember_merge(st, card_msg, plan)
         if summary:   # the summary itself, under the card: the decision's evidence one tap away
             try:
                 f = STATE.parent / "goals" / name
@@ -820,6 +983,8 @@ def on_callback(cq: dict, st: dict) -> None:
         save_state(st)
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         return
+    if action in ("acceptmerge", "merge"):
+        return on_merge(cq, st, msg, action, gid, key)
     etype = {"approve": "goal.approved", "accept": "goal.accepted"}.get(action)
     if action == "budget":
         gid, _, hours = gid.rpartition(":")
@@ -863,6 +1028,8 @@ def on_callback(cq: dict, st: dict) -> None:
     st["decided"] = (st["decided"] + [key])[-200:]
     save_state(st)
     status = f"\n\n{'✅' if ok else '❌'} {info}"
+    if ok and action == "accept" and (st.get("merge_shown") or {}).get(str(msg.get("message_id"))):
+        status += f"\nIts code isn't merged: send /merge {gid} to put it into main."
     # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice. The card's
     # formatting (entities) is kept; the status goes after it, so their offsets still hold.
     if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
@@ -1067,7 +1234,8 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
         tg("sendMessage", chat_id=ALLOW["chat_id"],
            text=f"{hp.HIVE_ID}: I'll message you when a goal needs approval or acceptance, or something escalates, "
                 "and send a digest every day. Use the buttons to decide. /inbox lists what's waiting; "
-                "/digest sends the digest now; /board shows what each agent is doing"
+                "/digest sends the digest now; /merge <goal> merges an accepted goal's reviewed code into main "
+                "(/merge alone lists what's waiting); /board shows what each agent is doing"
                 + ("; /floor opens the Floor." if FLOOR_PUBLIC else "."))
         return
     if text == "/digest":
@@ -1076,6 +1244,9 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if text == "/inbox":
         st["notified"] = []          # re-send everything that's still waiting
         push_inbox(st)
+        return
+    if text and text.split()[0].split("@")[0] == "/merge":
+        merge_command(st, text)
         return
     if chat_cmd:
         if CHAT.unfinished_tasks:

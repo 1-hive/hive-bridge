@@ -898,6 +898,23 @@ def open_requests() -> list[str]:
     return [Path(x).stem for x in r.stdout.split() if x.endswith(".md")] if r.returncode == 0 else []
 
 
+LOG_LINE = re.compile(r"^- \d{4}-\d{2}-\d{2}")
+LOG_SHOWN = 8   # a goal's new log lines shown per digest; the rest are counted
+
+
+def goal_log(gid: str) -> list[str]:
+    """A goal's log (hive-runtime docs/chief-of-staff.md, "Running a goal": goals/<date>-<goal>-log.md beside the goal
+    file, one dated line per decision or stage change, appended), from the workspace's main: its dated lines."""
+    r = subprocess.run(["git", "-C", str(WORKSPACE), "ls-tree", "-r", "--name-only", "main", "projects/"],
+                       capture_output=True, text=True)
+    name = re.compile(rf"/goals/\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(gid)}-log\.md$")
+    path = next((x for x in r.stdout.splitlines() if name.search(x)), None) if r.returncode == 0 else None
+    if not path:
+        return []
+    body = subprocess.run(["git", "-C", str(WORKSPACE), "show", f"main:{path}"], capture_output=True, text=True).stdout
+    return [x.strip() for x in body.splitlines() if LOG_LINE.match(x.strip())]
+
+
 def digest_text(st: dict) -> tuple[str, int] | None:
     """The digest, deterministic from the record: (text, head position)."""
     ok, out = hive("state")
@@ -914,6 +931,8 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     tasks_by_goal: dict = {}
     for t in state.get("tasks", {}).values():
         tasks_by_goal.setdefault(t.get("goal"), []).append(t)
+    since_iso = dt.datetime.fromtimestamp(st.get("digest_at", 0), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    log_next = st["log_next"] = {}   # each goal's log lines shown in this digest: send_digest keeps them once it's sent
     lines = [f"📊 <b>{hp.HIVE_ID} digest</b> · {dt.datetime.now().astimezone():%a %d %b %H:%M}",
              f"{len(events)} events since the last digest (now at position {head})."]
     shown = 0
@@ -932,6 +951,20 @@ def digest_text(st: dict) -> tuple[str, int] | None:
                 line += f", escalated to {t['ext']['escalation'].get('to')}"
         if g.get("escalation"):
             line += f"\n  ⚠️ escalated to {g['escalation'].get('to')}: {esc(g['escalation'].get('reason', ''))}"
+        if g["status"] == "active":
+            done = [t for t in ts_ if t["status"] == "done" and (t.get("status_since") or "")[:19] >= since_iso]
+            if done:
+                line += f"\n  done since the last digest: " + "; ".join(esc(t.get("title") or t["id"]) for t in done)
+            idle = (st.get("goal_idle") or {}).get(g["id"])
+            if not open_ and idle:
+                line += f"\n  ⏸ no open task since {dt.datetime.fromtimestamp(idle['since']).astimezone():%a %H:%M}"
+            log_lines = goal_log(g["id"])
+            new = log_lines[(st.get("log_shown") or {}).get(g["id"], 0):]
+            log_next[g["id"]] = len(log_lines)
+            if new:
+                line += "\n  Decided (goal log):" + "".join(f"\n  {esc(cut(x, 300))}" for x in new[:LOG_SHOWN])
+                if len(new) > LOG_SHOWN:
+                    line += f"\n  … and {len(new) - LOG_SHOWN} more in the goal log"
         if g.get("budget"):
             line += f"\n  budget {g['budget']}, spent {g.get('spent')}"
         lines.append(line)
@@ -960,6 +993,7 @@ def send_digest(st: dict) -> None:
     text, head = d
     tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML")
     st["digest_pos"], st["digest_at"] = head, time.time()
+    st.setdefault("log_shown", {}).update(st.pop("log_next", {}))
     save_state(st)
     log(f"digest sent (position {head})")
 
@@ -1141,7 +1175,8 @@ def on_repo_callback(cq: dict, st: dict, action: str, key: str) -> None:
 
 # Decision cards answered by tapping (decision_buttons.py): the ❓ notice of a worker's card gets one button per
 # answer; an operator's tap is shown on the message and passed to the chief of staff, which records the answer.
-def offer_buttons(st: dict, task: str, c: dict, chat: int, message: dict | None, text: str) -> None:
+def offer_buttons(st: dict, task: str, c: dict, chat: int, message: dict | None, text: str,
+                  decided: bool = False) -> None:
     """Put the card's answer buttons on the ❓ message just sent (when any question offers answers)."""
     if not message or not message.get("message_id"):
         return
@@ -1155,6 +1190,8 @@ def offer_buttons(st: dict, task: str, c: dict, chat: int, message: dict | None,
         return
     cards = st["decision_cards"]
     cards[key] = db.new_entry(task, c, chat, message["message_id"], text)
+    if decided:   # the chief of staff answered it already: a tap is a second opinion (decision_buttons.tap)
+        cards[key]["decided"] = True
     for old in sorted(cards, key=lambda k: cards[k]["message"])[:-200]:   # keep the last 200
         cards.pop(old, None)
     save_state(st)
@@ -1762,6 +1799,49 @@ def ping_cos_trouble(st: dict, chat_cmd: str) -> None:
     save_state(st)
 
 
+# An active goal with no open task wakes the chief of staff once per idle spell, after this long: it runs a goal to its
+# end without asking (hive-runtime docs/chief-of-staff.md, "Running a goal"), and nothing else wakes it when a goal's
+# work runs out. HIVE_IDLE_GOAL_MINUTES=0 turns it off.
+IDLE_GOAL_S = float(os.environ.get("HIVE_IDLE_GOAL_MINUTES", "30") or 0) * 60
+IDLE_CHECK_S = 300   # how often the main loop looks
+
+
+def goal_state() -> dict | None:
+    ok, out = hive("state")
+    return json.loads(out) if ok else None
+
+
+def ping_cos_idle(st: dict, chat_cmd: str, state: dict | None = None) -> None:
+    """Tell the chief of staff once when an active goal has had no open task for IDLE_GOAL_S, unless the goal waits on
+    the operator (escalated, e.g. over budget). A task opening ends the spell; the next spell is told again. The time
+    is counted from when the bridge first saw the goal idle, so a restart only delays it."""
+    if not IDLE_GOAL_S:
+        return
+    state = state if state is not None else goal_state()
+    if state is None:
+        return
+    goals = state.get("goals") or {}
+    busy = {t.get("goal") for t in (state.get("tasks") or {}).values() if t.get("status") in OPEN}
+    idle = st.setdefault("goal_idle", {})   # goal -> {"since", "told"}
+    now = time.time()
+    for gid, g in goals.items():
+        if g.get("status") != "active" or gid in busy or g.get("escalation"):
+            idle.pop(gid, None)
+            continue
+        p = idle.setdefault(gid, {"since": now, "told": False})
+        if not p["told"] and now - p["since"] >= IDLE_GOAL_S:
+            p["told"] = True
+            CHAT.put((chat_cmd, f"Goal {gid} (\"{g.get('title', '')}\") is active, and none of its tasks has been open "
+                                f"for {int((now - p['since']) // 60)} min. Run it on as your doc says (Running a goal): "
+                                "start its next work, or complete it if its success criteria are met or shown out of "
+                                "reach, and log what you decided in its goal log. Reply with nothing unless the human "
+                                "must do something before it can go on; then say what, in one line.", False, None))
+            log(f"pinged cos: goal {gid} idle")
+    for gid in [k for k in idle if k not in goals]:
+        idle.pop(gid)
+    save_state(st)
+
+
 def relay_floor_alerts(st: dict) -> None:
     """Send the operators the Floor's alerts (an agent reporting a problem for 10 min, and its recovery). A Floor
     without the bot's token (it faces the internet) queues them at /api/alerts; each is sent once."""
@@ -2212,6 +2292,83 @@ def chunks(text: str, n: int = 3900) -> list[str]:
     return out + [text] if text else out
 
 
+# A worker's question on a chat-started task waits this long before it is posted as a question: the chief of staff
+# answers most within a minute or two, and one it answered is posted as decided (what was asked, its answer, the same
+# buttons), so the humans aren't asked what was already settled. HIVE_QUESTION_GRACE_MINUTES=0 posts at once.
+QUESTION_GRACE_S = float(os.environ.get("HIVE_QUESTION_GRACE_MINUTES", "10") or 0) * 60
+
+
+def ref_pin(e: dict, rel: str) -> dict | None:
+    return next((r.get("pin") for r in e.get("refs") or [] if r.get("rel") == rel), None)
+
+
+def answer_of(task: str, after: int) -> dict | None:
+    """The chief of staff's task.answered on task after position `after`, if any."""
+    ok, out = hive("events", "--task", task, "--after", str(after), "--type", "task.answered")
+    evs = [json.loads(x) for x in out.splitlines() if x.strip()] if ok else []
+    return next((e for e in evs if e.get("type") == "task.answered" and e.get("task") == task), None)
+
+
+def flush_questions(st: dict, o: dict) -> None:
+    """Post each held question: as decided once the chief of staff answered it, or as a question after
+    QUESTION_GRACE_S. A task no longer followed (cancelled) drops its question."""
+    held = st.get("q_held") or {}
+    for k in sorted(held, key=lambda k: held[k]["event"].get("position", 0)):
+        h, t = held[k], held[k]["task"]
+        if t not in o:
+            held.pop(k)
+            continue
+        ans = answer_of(t, h["event"].get("position", 0))
+        if ans:
+            send_decided(t, o[t], h["event"], ans, st)
+        elif time.time() - h["at"] >= QUESTION_GRACE_S:
+            send_question(t, o[t], h["event"], st)
+        else:
+            continue
+        held.pop(k)
+
+
+ANSWER_HEAD = re.compile(r"^\**\s*answer\s*\**\s*:\s*\**\s*", re.I)   # Answer:, **Answer:**, **Answer**:
+
+
+def answer_gist(text: str) -> str:
+    """The answer file's answer: from its "Answer:" line on, else its text without headings."""
+    lines = (text or "").splitlines()
+    start = next((i for i, x in enumerate(lines) if ANSWER_HEAD.match(x.strip())), None)
+    if start is not None:
+        lines = [ANSWER_HEAD.sub("", lines[start].strip())] + lines[start + 1:]
+    return "\n".join(x for x in lines if not x.lstrip().startswith("#")).strip()
+
+
+def send_decided(task: str, origin: dict, e: dict, ans: dict, st: dict | None = None) -> None:
+    """A worker's question the chief of staff answered within the grace: one reply under the task's status message
+    saying what was asked and what it decided, the card's buttons kept so an operator can still choose otherwise,
+    and the answer file under it."""
+    d = e.get("data") or {}
+    full = result_text(ref_pin(e, "question") or {})
+    answer = result_text(ref_pin(ans, "answer") or {}) or ""
+    who = str((e.get("actor") or {}).get("id") or "").removeprefix("worker.")
+    head = f"✅ {who or task} asked" + (f" on {task}" if who else "") + "; the chief of staff decided it"
+    c = card.parse(full or "")
+    asked = card.render(c, head) if c else f"{head}\n\n{cut((d.get('reason') or '').strip(), QUESTION_MAX)}"
+    gist = answer_gist(answer)
+    text = (f"{asked}\n\nIts answer: {cut(gist, 900) if gist else '(see the record)'}\n\nThe work goes on with that. "
+            + ("Tap to choose otherwise, or reply here." if c else "Reply here to change it."))
+    reply = {"reply_to_message_id": origin.get("status_id") or origin["message_id"], "allow_sending_without_reply": True}
+    for i, part in enumerate(chunks(text)):
+        m = safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))
+        if i == 0 and c and st is not None:
+            offer_buttons(st, task, c, origin["chat_id"], m, part, decided=True)
+    if answer:
+        f = STATE.parent / "questions" / f"{task}-{e.get('position', 0)}-answer.md"
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(answer)
+            tg_file("sendDocument", "document", f, chat_id=origin["chat_id"], caption=f"{task}: the chief of staff's answer", **reply)
+        except Exception as ex:
+            log(f"answer of {task}: {ex}")
+
+
 def send_question(task: str, origin: dict, e: dict, st: dict | None = None) -> None:
     """A worker's question, as its own reply under the task's status message: a header saying what it needs, the
     question as the worker put it, then the worker's question file (options, recommendation, evidence). A long
@@ -2302,10 +2459,10 @@ def push_origins(st: dict) -> None:
         text = f(e, d).replace("{n}", str(1 + sum(k == "review.recorded" for k, _ in steps)))
         steps.append([e["type"], text])
         touched.add(t)
-        if e["type"] == "task.blocked":   # a question needs someone: its own message, not only a step
+        if e["type"] == "task.blocked":   # a question: its own message, once the chief of staff had its chance
             show_status(t, o[t])
             touched.discard(t)
-            send_question(t, o[t], e, st)
+            st.setdefault("q_held", {})[f"{t}@{e['position']}"] = {"task": t, "event": e, "at": time.time()}
         if e["type"] == "task.closed":
             show_status(t, o[t])
             touched.discard(t)
@@ -2317,6 +2474,7 @@ def push_origins(st: dict) -> None:
             del o[t]
     for t in touched:
         show_status(t, o[t])
+    flush_questions(st, o)
     for t in [t for t, x in o.items() if time.time() - x.get("closed", time.time()) > ORIGIN_KEEP]:
         del o[t]
     save_origins(o)
@@ -2624,7 +2782,7 @@ def main() -> None:
     threading.Thread(target=chat_worker, daemon=True).start()
     set_menu_button()
     log("bridge up")
-    next_inbox = 0.0
+    next_inbox = next_idle = 0.0
     while True:
         try:
             # The first run sends one now; afterwards, at each digest time.
@@ -2642,6 +2800,9 @@ def main() -> None:
                 if a.chat_cmd:
                     ping_cos(st, a.chat_cmd)
                     check_followups(a.chat_cmd)
+                    if time.time() >= next_idle:
+                        ping_cos_idle(st, a.chat_cmd)
+                        next_idle = time.time() + IDLE_CHECK_S
                     if BOARD_BOTS:
                         ping_cos_trouble(st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every

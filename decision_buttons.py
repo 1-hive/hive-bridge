@@ -72,6 +72,14 @@ def tap(entry: dict, qi: int, oi: int, who: str) -> tuple[bool, str, str, str]:
     entry["answered"][str(qi)] = {"choice": choice, "by": who}
     line = f"✅ {qi + 1} · {choice} ({who})"
     q = qs[qi]
+    if entry.get("decided"):   # the chief of staff answered it, and the worker went on with that answer
+        cos = (f"{who} (operator) tapped \"{choice}\" on question {qi + 1} of {entry['task']}'s decision card, which "
+               f"you had already answered; the worker went on with your answer. The question: {q} If that's what you "
+               f"answered, add who chose it to the answer file (citing telegram:{entry['chat']}/{entry['message']}) "
+               "and reply with nothing. If it differs, their choice wins: say in one line what it changes, then put "
+               "the work right with what your doc allows (a follow-up task with their choice, or cancelling the task "
+               "and filing it again).")
+        return True, f"{choice}: sent to the chief of staff", line, cos
     cos = (f"{who} (operator) answered question {qi + 1} of {entry['task']}'s decision card by tapping \"{choice}\". "
            f"The question: {q} Record task.answered on {entry['task']} with this answer (an answer file saying who "
            f"chose what, citing telegram:{entry['chat']}/{entry['message']})"

@@ -228,6 +228,7 @@ def main():
             {"position": 58, "type": "review.recorded", "task": "tq", "actor": {"id": "worker.bot1"}, "data": {"verdict": "passed"}}]
     st["origin_pos"] = 55
     b.hive = lambda *a: (True, "\n".join(json.dumps(e) for e in qevs)) if a[0] == "events" else (True, "{}")
+    b.QUESTION_GRACE_S = 0   # questions posted at once here; goal_runs_on_test covers the grace and "decided"
     sent.clear()
     b.push_origins(st)
     lines = [(p["reply_to_message_id"], p["text"]) for meth, p in sent if meth == "sendMessage"]

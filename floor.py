@@ -113,8 +113,9 @@ def api_state(q: dict) -> dict:
                                                      "escalation", "relevance", "spent", "status_since")}
     tasks = {}
     for t in s["tasks"].values():
-        # a hive without goals (proto-hive profile): every task, under no goal
-        if t.get("goal") not in goals and (s.get("goals") or t["status"] in ("done", "cancelled", "released")):
+        # a task with no goal (a hive without goals, or a task from before its hive took goals): shown while open;
+        # a task of a goal no longer on the board isn't
+        if t.get("goal") not in goals and (t.get("goal") or t["status"] in ("done", "cancelled", "released")):
             continue
         ext = t.get("ext") or {}
         rev = t.get("latest_review") or {}

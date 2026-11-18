@@ -118,7 +118,7 @@ def test_digest(b, tmp: Path, ws: Path) -> None:
     st = {"digest_pos": 0, "digest_at": 1_794_000_000.0 - 86400 * 10, "goal_idle": {"stage2-learn": {"since": clock[0] - 3600, "told": True}}}
     b.send_digest(st)
     text = sent[-1]
-    assert "done since the last digest: Imitation pilot; Self-play pilot" in text, text
+    assert "done since the last digest (2): Imitation pilot; Self-play pilot" in text, text
     assert "Decided (goal log):" in text and "imitation pilot first" in text and "self-play next" in text, text
     assert "not this goal's log" not in text, "only this goal's log, not one whose name ends the same"
     assert "⏸ no open task since" in text, text

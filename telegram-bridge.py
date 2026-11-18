@@ -103,6 +103,30 @@ _GROUPS_FILE = CFG / "telegram-groups.json"
 GROUPS = json.loads(_GROUPS_FILE.read_text()) if _GROUPS_FILE.is_file() else {}
 CHATS = {c["chat_id"]: c for c in GROUPS.get("chats", [])}
 HUMANS = {h["user_id"]: h for h in GROUPS.get("humans", [])}
+# Where inbox cards (a goal to approve, ⏹ Stop, a completed goal to accept or merge, +budget, restart, a question
+# waiting), their follow-ups and the digest go, and where their buttons count: the operator's private chat, or a group
+# (HIVE_CARDS_CHAT: a chat id, e.g. the proto-hive's Work group) so that every operator there sees and decides them.
+# Only operators' taps count, wherever. Each card's state is keyed by chat and message (card_key).
+CARDS = int(os.environ.get("HIVE_CARDS_CHAT") or 0) or ALLOW["chat_id"]
+STANDING = "standing-"   # a standing goal (one per line of work, never completed): no start ping, no idle wake
+
+
+def card_key(chat, mid) -> str:
+    return f"{chat}:{mid}"
+
+
+def card_shown(st: dict, name: str, chat, mid, default=None):
+    """What a card showed (st[name]: inputs_shown, merge_shown), by chat and message; a card from before keys named
+    the chat (the private chat only) by its message id."""
+    d = st.get(name) or {}
+    k = card_key(chat, mid)
+    if k in d:
+        return d[k]
+    return d.get(str(mid), default) if chat == ALLOW["chat_id"] else default
+
+
+def msg_chat(msg: dict):
+    return (msg.get("chat") or {}).get("id") or CARDS
 # The humans the chief of staff may tag: "@<username>" in a plain-text reply notifies them (telegram-groups.json)
 PEOPLE = [{"name": h["name"], "handle": f"@{h['username']}", **({"operator": True} if "operator" in h.get("permissions", []) else {})}
           for h in GROUPS.get("humans", []) if h.get("username")]
@@ -256,12 +280,12 @@ def remember_inputs(st: dict, message: dict | None, gid: str) -> None:
     """Which host inputs this approval card showed, so a tap on it can't approve others (a revision since)."""
     if message and "message_id" in message:
         shown = st.setdefault("inputs_shown", {})
-        shown[str(message["message_id"])] = SHOWN_INPUTS.get(gid, [])
+        shown[card_key(msg_chat(message), message["message_id"])] = SHOWN_INPUTS.get(gid, [])
         for k in list(shown)[:-200]:
             del shown[k]
 
 
-def inputs_changed(st: dict, message_id, gid: str) -> bool:
+def inputs_changed(st: dict, msg: dict, gid: str) -> bool:
     """Approve tapped on a card: do the goal's host inputs now differ from what that card showed? A card from before
     this check (none recorded) counts as having shown none."""
     ok, out = hive("goal", gid)
@@ -269,7 +293,7 @@ def inputs_changed(st: dict, message_id, gid: str) -> bool:
         return False   # the approval itself will report the problem
     g = json.loads(out)
     now, _ = goal_inputs(g.get("goal", g))
-    return now != (st.get("inputs_shown") or {}).get(str(message_id), [])
+    return now != card_shown(st, "inputs_shown", msg_chat(msg), msg.get("message_id"), [])
 
 
 ACCEPT_HEAD = re.compile(r"^(#{1,6})\s*what acceptance means\s*:?\s*$", re.I)
@@ -323,13 +347,13 @@ def send_card(text: str, kb: list) -> dict:
     """An inbox card. If Telegram can't parse its HTML, it goes as plain text, so a decision is never lost to markup."""
     extra = {"reply_markup": {"inline_keyboard": kb}} if kb else {}
     try:
-        return tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML", **extra)
+        return tg("sendMessage", chat_id=CARDS, text=text, parse_mode="HTML", **extra)
     except RuntimeError as e:
         if "parse" not in str(e).lower():
             raise
         log(f"card sent as plain text: {e}")
         plain = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-        return tg("sendMessage", chat_id=ALLOW["chat_id"], text=plain, **extra)
+        return tg("sendMessage", chat_id=CARDS, text=plain, **extra)
 
 
 def buttons(item: dict, plan: dict | None = None) -> list:
@@ -412,7 +436,7 @@ def remember_merge(st: dict, message: dict | None, plan: dict | None) -> None:
     """Which plan this card showed (its digest, or None if it offered no merge), so a tap merges only that."""
     if message and "message_id" in message:
         shown = st.setdefault("merge_shown", {})
-        shown[str(message["message_id"])] = plan["digest"] if plan and plan.get("mergeable") else None
+        shown[card_key(msg_chat(message), message["message_id"])] = plan["digest"] if plan and plan.get("mergeable") else None
         for k in list(shown)[:-200]:
             del shown[k]
 
@@ -428,24 +452,26 @@ def merge_card(gid: str, p: dict, changed: bool = False) -> tuple[str, list]:
     return text, kb
 
 
-def merge_command(st: dict, text: str) -> None:
-    """/merge <goal>: a merge card for that goal. /merge alone: the recent goals whose reviewed code isn't in main."""
+def merge_command(st: dict, text: str, chat=None) -> None:
+    """/merge <goal>: a merge card for that goal. /merge alone: the recent goals whose reviewed code isn't in main.
+    Replies go to the chat it was sent in; the card to the cards chat."""
+    chat = chat or ALLOW["chat_id"]
     args = text.split()[1:]
     if not MERGE_PY:
-        tg("sendMessage", chat_id=ALLOW["chat_id"], text="Merging isn't set up here: hive-runtime's merge.py wasn't found.")
+        tg("sendMessage", chat_id=chat, text="Merging isn't set up here: hive-runtime's merge.py wasn't found.")
         return
     if not args:
         ok, out = hive("state")
         goals = [g for g in json.loads(out)["goals"].values() if g.get("status") in ("accepted", "completed")] if ok else []
         goals.sort(key=lambda g: g.get("status_since") or 0, reverse=True)
         ready = [g["id"] for g in goals[:12] if (merge_plan(g["id"]) or {}).get("mergeable")]
-        tg("sendMessage", chat_id=ALLOW["chat_id"], parse_mode="HTML",
+        tg("sendMessage", chat_id=chat, parse_mode="HTML",
            text=("Reviewed code not in main yet:\n" + "\n".join(f"<code>/merge {esc(x)}</code>" for x in ready)) if ready
            else "No recent goal has reviewed code waiting to be merged.")
         return
     p = merge_plan(args[0])
     if not p:
-        tg("sendMessage", chat_id=ALLOW["chat_id"], text=f"❌ Couldn't plan a merge for {args[0]}: no such goal, or see the bridge's log.")
+        tg("sendMessage", chat_id=chat, text=f"❌ Couldn't plan a merge for {args[0]}: no such goal, or see the bridge's log.")
         return
     text, kb = merge_card(args[0], p)
     remember_merge(st, send_card(text, kb), p)
@@ -457,14 +483,14 @@ def on_merge(cq: dict, st: dict, msg: dict, action: str, gid: str, key: str) -> 
     If the plan changed since the card (main moved, another result passed review), nothing happens and the current card
     goes out instead. If merging fails, nothing is accepted and the card keeps its buttons."""
     safe("answerCallbackQuery", callback_query_id=cq["id"])
-    mid = msg.get("message_id")
+    mid, chat = msg.get("message_id"), msg_chat(msg)
     p = merge_plan(gid)
     if not p:
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"❌ Couldn't plan the merge of {gid} (the bridge's log says "
+        safe("sendMessage", chat_id=chat, text=f"❌ Couldn't plan the merge of {gid} (the bridge's log says "
              "why). Nothing was merged or accepted.")
         return
-    if p["digest"] != (st.get("merge_shown") or {}).get(str(mid)):
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=mid, reply_markup={"inline_keyboard": []})
+    if p["digest"] != card_shown(st, "merge_shown", chat, mid):
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
         if action == "acceptmerge":
             body, _, _ = completed_text(gid, p)
             text = (f"{HEAD['goal_completed']}\n\n<i>Not merged or accepted: what would be merged changed since the card "
@@ -479,11 +505,11 @@ def on_merge(cq: dict, st: dict, msg: dict, action: str, gid: str, key: str) -> 
     ok, o = run_merge(gid, p["digest"], "Telegram: Accept + merge" if action == "acceptmerge" else "Telegram: /merge")
     if not ok:
         log(f"{action} {gid}: not merged: {o}")
-        safe("sendMessage", chat_id=ALLOW["chat_id"],
+        safe("sendMessage", chat_id=chat,
              text=f"❌ Not merged{' or accepted' if action == 'acceptmerge' else ''}: {o}"
                   + ("\nThe card's other buttons still work (Accept only accepts without merging)." if action == "acceptmerge" else ""))
         return
-    lines = [f"🔀 Merged: {o['line']}"]
+    lines = [f"🔀 Merged: {o['line']} ({sender_name(cq.get('from') or {})})"]
     accepted = False
     if action == "acceptmerge":
         accepted, info = emit("goal.accepted", gid, {"note": cut(f"Accept + merge. Merged into main: {o['line']}", 480)})
@@ -492,10 +518,10 @@ def on_merge(cq: dict, st: dict, msg: dict, action: str, gid: str, key: str) -> 
     st["decided"] = (st["decided"] + [key])[-200:]
     save_state(st)
     status = "\n\n" + "\n".join(lines)
-    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=mid, text=(msg.get("text") or "") + status,
+    if safe("editMessageText", chat_id=chat, message_id=mid, text=(msg.get("text") or "") + status,
             **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=mid, reply_markup={"inline_keyboard": []})
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=chat, text=status.strip())
     if CHAT_CMD:
         CHAT.put((CHAT_CMD, f"The operator {'accepted goal ' + gid + ' and ' if accepted else ''}merged goal {gid}'s "
                   f"reviewed code into main ({o['line']}). Nothing is left to merge for it; new work branches from the "
@@ -604,18 +630,19 @@ def stop_goal(cq: dict, st: dict, msg: dict, gid: str, key: str) -> None:
     """⏹ Stop on a goal that started on an operator's words: abandon it, and tell the chief of staff to cancel its tasks."""
     safe("answerCallbackQuery", callback_query_id=cq["id"])
     ok, info = emit("goal.abandoned", gid, {"reason": STOP_REASON})
-    log(f"stop {gid}: {info}")
+    who = sender_name(cq.get("from") or {})
+    log(f"stop {gid} ({who}): {info}")
     st["decided"] = (st["decided"] + [key])[-200:]
     if ok:
         st.setdefault("stopped", {})[gid] = time.time()
     save_state(st)
-    status = f"\n\n{'⏹' if ok else '❌'} {info}"
-    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"], text=(msg.get("text") or "") + status,
+    status = f"\n\n{'⏹' if ok else '❌'} {info} ({who})"
+    if safe("editMessageText", chat_id=msg_chat(msg), message_id=msg["message_id"], text=(msg.get("text") or "") + status,
             **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"], reply_markup={"inline_keyboard": []})
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
+        safe("editMessageReplyMarkup", chat_id=msg_chat(msg), message_id=msg["message_id"], reply_markup={"inline_keyboard": []})
+        safe("sendMessage", chat_id=msg_chat(msg), text=status.strip())
     if ok and CHAT_CMD:
-        CHAT.put((CHAT_CMD, f"The operator tapped ⏹ Stop on goal {gid}, which had started on their request: it is "
+        CHAT.put((CHAT_CMD, f"The operator {who} tapped ⏹ Stop on goal {gid}, which had started on their request: it is "
                   f"abandoned ({info}). Cancel its open tasks (task.cancelled) and stop work on it. Reply in one line.",
                   False, None))
 
@@ -636,7 +663,7 @@ def auto_accept(item: dict, st: dict) -> None:
     log(f"auto-accept {gid}: {info}")
     if ok:
         st.get("completed_seen", {}).pop(item["key"], None)
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"✅ Goal {gid} accepted on its own: {AUTO_ACCEPT_DAYS:g} days "
+        safe("sendMessage", chat_id=CARDS, text=f"✅ Goal {gid} accepted on its own: {AUTO_ACCEPT_DAYS:g} days "
              f"without a reopen, and nothing to merge ({info}).")
     else:
         st.setdefault("auto_accept_failed", {})[item["key"]] = time.time()
@@ -700,6 +727,8 @@ def on_pr_merge(cq: dict, st: dict, k: str) -> None:
 
 def budget_kb(item: dict) -> list:
     if item["kind"] == "escalation_open" and item["entity"] == "goal" and item["title"].startswith("budget_exceeded"):
+        if item["id"].startswith(STANDING):   # a standing goal's budget is a period, not a deadline
+            return [[{"text": "⏱ +30 days", "callback_data": f"budget:{item['id']}:720"}]]
         return [[{"text": "⏱ +4h", "callback_data": f"budget:{item['id']}:4"}]]
     return restart_kb(item)
 
@@ -773,8 +802,11 @@ def push_inbox(st: dict) -> None:
         del seen[k]                              # accepted, reopened or abandoned since
     stopped = {g: t for g, t in (st.get("stopped") or {}).items() if now - t < 3600}
     st["stopped"] = stopped
+    threaded = set(load_origins()) if CARDS != ALLOW["chat_id"] else set()
     for item in items + waiting_questions(st, now):
         question = item["kind"] == "task_blocked_unanswered_any"
+        if question and item["id"] in threaded:
+            continue   # the cards chat is a group: the question is already on its task's thread there
         if item["kind"] == "goal_abandoned_open_tasks" and item["id"] in stopped:
             continue   # just stopped with ⏹: the chief of staff is cancelling its tasks
         plan = merge_plan(item["id"]) if item["kind"] == "goal_completed" else None
@@ -828,7 +860,7 @@ def push_inbox(st: dict) -> None:
                 f = STATE.parent / "goals" / name
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(summary)
-                tg_file("sendDocument", "document", f, chat_id=ALLOW["chat_id"], caption=f"{item['id']}: the goal summary",
+                tg_file("sendDocument", "document", f, chat_id=CARDS, caption=f"{item['id']}: the goal summary",
                         reply_to_message_id=card_msg["message_id"], allow_sending_without_reply="true")
             except Exception as e:
                 log(f"summary of {item['id']} not sent: {e}")
@@ -954,7 +986,8 @@ def digest_text(st: dict) -> tuple[str, int] | None:
         if g["status"] == "active":
             done = [t for t in ts_ if t["status"] == "done" and (t.get("status_since") or "")[:19] >= since_iso]
             if done:
-                line += f"\n  done since the last digest: " + "; ".join(esc(t.get("title") or t["id"]) for t in done)
+                line += f"\n  done since the last digest ({len(done)}): " + "; ".join(esc(t.get("title") or t["id"]) for t in done[:8])
+                line += f"; … and {len(done) - 8} more" if len(done) > 8 else ""
             idle = (st.get("goal_idle") or {}).get(g["id"])
             if not open_ and idle:
                 line += f"\n  ⏸ no open task since {dt.datetime.fromtimestamp(idle['since']).astimezone():%a %H:%M}"
@@ -991,7 +1024,7 @@ def send_digest(st: dict) -> None:
         log("digest: record unreachable")
         return
     text, head = d
-    tg("sendMessage", chat_id=ALLOW["chat_id"], text=text, parse_mode="HTML")
+    tg("sendMessage", chat_id=CARDS, text=text, parse_mode="HTML")
     st["digest_pos"], st["digest_at"] = head, time.time()
     st.setdefault("log_shown", {}).update(st.pop("log_next", {}))
     save_state(st)
@@ -1033,8 +1066,8 @@ def is_operator(user_id) -> bool:
 
 
 def allowed(frm: dict, chat: dict) -> bool:
-    """The operator chat, from a human with the operator permission: buttons and commands."""
-    return chat.get("id") == ALLOW["chat_id"] and is_operator(frm.get("id"))
+    """The operator chat or the cards chat, from a human with the operator permission: buttons and commands."""
+    return chat.get("id") in (ALLOW["chat_id"], CARDS) and is_operator(frm.get("id"))
 
 
 # New repositories (hive-runtime new-repo.py): the chief of staff files a request whose front matter says
@@ -1239,14 +1272,16 @@ def on_callback(cq: dict, st: dict) -> None:
         log(f"refused callback from {cq.get('from', {}).get('id')}")
         return
     action, _, gid = (cq.get("data") or "").partition(":")
-    key = f"{msg.get('message_id')}:{action}"
-    if key in st.setdefault("decided", []):
+    chat, who = msg_chat(msg), sender_name(cq.get("from") or {})
+    key = f"{card_key(chat, msg.get('message_id'))}:{action}"
+    legacy = f"{msg.get('message_id')}:{action}" if chat == ALLOW["chat_id"] else None   # decided before keys named the chat
+    if key in st.setdefault("decided", []) or (legacy and legacy in st["decided"]):
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="already done")
         return
     if action in ("reopen", "abandon"):
-        p = tg("sendMessage", chat_id=ALLOW["chat_id"], text=f"Reason to {action} <code>{esc(gid)}</code>? Reply to this message.",
-               parse_mode="HTML", reply_markup={"force_reply": True})
-        st["pending_reason"][str(p["message_id"])] = [action, gid]
+        p = tg("sendMessage", chat_id=chat, text=f"Reason to {action} <code>{esc(gid)}</code>? {esc(who)}, reply to this message.",
+               parse_mode="HTML", reply_markup={"force_reply": True, "selective": True}, reply_to_message_id=msg.get("message_id"))
+        st["pending_reason"][card_key(chat, p["message_id"])] = [action, gid]
         save_state(st)
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         return
@@ -1259,31 +1294,31 @@ def on_callback(cq: dict, st: dict) -> None:
         gid, _, hours = gid.rpartition(":")
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         ok, info = extend_budget(gid, float(hours), "telegram")
-        log(f"budget {gid} +{hours}h: {info}")
+        log(f"budget {gid} +{hours}h ({who}): {info}")
         st["decided"] = (st["decided"] + [key])[-200:]
         save_state(st)
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=msg["message_id"],
              reply_markup={"inline_keyboard": []})
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"{'✅' if ok else '❌'} {info}")
+        safe("sendMessage", chat_id=chat, text=f"{'✅' if ok else '❌'} {info} ({who})")
         return
     if action == "restart":
         safe("answerCallbackQuery", callback_query_id=cq["id"])
         ok, info = restart_task(gid)
-        log(f"restart {gid}: {info}")
+        log(f"restart {gid} ({who}): {info}")
         st["decided"] = (st["decided"] + [key])[-200:]
         save_state(st)
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=msg["message_id"],
              reply_markup={"inline_keyboard": []})
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=f"{'✅' if ok else '❌'} {info}")
+        safe("sendMessage", chat_id=chat, text=f"{'✅' if ok else '❌'} {info} ({who})")
         return
     if not etype:
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="unknown action")
         return
-    if action == "approve" and inputs_changed(st, msg.get("message_id"), gid):
+    if action == "approve" and inputs_changed(st, msg, gid):
         # Approving grants the host inputs the goal declares now (hive-runtime inputs.py), and this card showed
         # others: not approved; the current card goes out instead, to tap there.
         safe("answerCallbackQuery", callback_query_id=cq["id"], text="its host inputs changed: see the new card")
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg.get("message_id"),
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=msg.get("message_id"),
              reply_markup={"inline_keyboard": []})
         text = (f"{HEAD['goal_proposed']}\n\n<i>Not approved: its host inputs changed since the card you tapped. "
                 f"This is the current goal.</i>\n\n{goal_text(gid, True)}\n\n<code>goal {gid}</code>")
@@ -1293,20 +1328,20 @@ def on_callback(cq: dict, st: dict) -> None:
         return
     safe("answerCallbackQuery", callback_query_id=cq["id"])
     ok, info = emit(etype, gid)
-    log(f"{action} {gid}: {info}")
+    log(f"{action} {gid} ({who}): {info}")
     st["decided"] = (st["decided"] + [key])[-200:]
     save_state(st)
-    status = f"\n\n{'✅' if ok else '❌'} {info}"
-    if ok and action == "accept" and (st.get("merge_shown") or {}).get(str(msg.get("message_id"))):
+    status = f"\n\n{'✅' if ok else '❌'} {info} ({who})"
+    if ok and action == "accept" and card_shown(st, "merge_shown", chat, msg.get("message_id")):
         status += f"\nIts code isn't merged: send /merge {gid} to put it into main."
     # The decision is recorded either way: show it, and drop the buttons so it can't be tapped twice. The card's
     # formatting (entities) is kept; the status goes after it, so their offsets still hold.
-    if safe("editMessageText", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+    if safe("editMessageText", chat_id=chat, message_id=msg["message_id"],
             text=(msg.get("text") or "") + status,
             **({"entities": msg["entities"]} if msg.get("entities") else {})) is None:
-        safe("editMessageReplyMarkup", chat_id=ALLOW["chat_id"], message_id=msg["message_id"],
+        safe("editMessageReplyMarkup", chat_id=chat, message_id=msg["message_id"],
              reply_markup={"inline_keyboard": []})
-        safe("sendMessage", chat_id=ALLOW["chat_id"], text=status.strip())
+        safe("sendMessage", chat_id=chat, text=status.strip())
 
 
 def sender_name(frm: dict) -> str:
@@ -1468,6 +1503,45 @@ def on_group_message(m: dict, st: dict, chat_cmd: str | None) -> None:
               {"chat_id": chat["id"], "reply_to": m["message_id"]}))
 
 
+def take_reason(m: dict, st: dict) -> bool:
+    """An operator's reply to a "Reason to reopen/abandon?" prompt (in the private chat or the cards chat): the reason,
+    recorded. Anyone else's reply, or a reply to anything else, isn't one."""
+    frm, chat = m.get("from") or {}, (m.get("chat") or {}).get("id")
+    rid = (m.get("reply_to_message") or {}).get("message_id")
+    pending = st.setdefault("pending_reason", {})
+    k = card_key(chat, rid) if card_key(chat, rid) in pending else (str(rid) if chat == ALLOW["chat_id"] and str(rid) in pending else None)
+    if rid is None or k is None or not is_operator(frm.get("id")):
+        return False
+    action, gid = pending.pop(k)
+    save_state(st)
+    text = (m.get("text") or m.get("caption") or "").strip()
+    etype = {"reopen": "goal.reopened", "abandon": "goal.abandoned"}[action]
+    ok, info = emit(etype, gid, {"reason": text[:500]})
+    who = sender_name(frm)
+    tg("sendMessage", chat_id=chat, text=f"{'✅' if ok else '❌'} {info} ({who})")
+    log(f"{action} {gid} ({who}): {info}")
+    return True
+
+
+CARD_COMMANDS = ("/merge", "/inbox", "/digest")
+
+
+def card_command(m: dict, st: dict) -> bool:
+    """/merge, /inbox or /digest from an operator in the cards chat (a group): handled here, like in the private chat."""
+    text = (m.get("text") or "").strip()
+    cmd = text.split()[0].split("@")[0] if text else ""
+    if cmd not in CARD_COMMANDS or not is_operator((m.get("from") or {}).get("id")):
+        return False
+    if cmd == "/digest":
+        send_digest(st)
+    elif cmd == "/inbox":
+        st["notified"] = []
+        push_inbox(st)
+    else:
+        merge_command(st, text, CARDS)
+    return True
+
+
 def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if m.get("migrate_to_chat_id") and (m.get("chat") or {}).get("id") in CHATS:
         # Telegram turned a configured group into a supergroup (e.g. a setting changed): it has a new id, and
@@ -1479,6 +1553,8 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
              f"in place of {old} (then restart hive-telegram).")
         return
     if (m.get("chat") or {}).get("type") in ("group", "supergroup") and (m["chat"]["id"] in CHATS or m["chat"]["id"] == ALLOW["chat_id"]):
+        if m["chat"]["id"] == CARDS and (take_reason(m, st) or card_command(m, st)):
+            return   # an operator's reason for a tapped Reopen/Abandon, or /merge, /inbox, /digest: not for the chief of staff
         on_group_message(m, st, chat_cmd)
         return
     text = (m.get("text") or m.get("caption") or "").strip()
@@ -1492,14 +1568,7 @@ def on_message(m: dict, st: dict, chat_cmd: str | None) -> None:
     if not allowed(frm, chat):
         log(f"ignored message from {frm.get('id')} in {chat.get('type')} {chat.get('id')} {chat.get('title')!r}")
         return
-    reply_to = str((m.get("reply_to_message") or {}).get("message_id", ""))
-    if reply_to in st["pending_reason"]:
-        action, gid = st["pending_reason"].pop(reply_to)
-        save_state(st)
-        etype = {"reopen": "goal.reopened", "abandon": "goal.abandoned"}[action]
-        ok, info = emit(etype, gid, {"reason": text[:500]})
-        tg("sendMessage", chat_id=ALLOW["chat_id"], text=f"{'✅' if ok else '❌'} {info}")
-        log(f"{action} {gid}: {info}")
+    if take_reason(m, st):
         return
     if text in ("/start", "/help"):
         tg("sendMessage", chat_id=ALLOW["chat_id"],
@@ -1716,7 +1785,8 @@ CHAT: queue.Queue = queue.Queue()   # (command, message, from the operator?)
 
 
 PINGS = {   # record event -> (state cursor, message to the chief of staff, or None to skip it)
-    "goal.approved": ("approved_pos", lambda e: f"Goal {e['goal']} was approved (position {e['position']}). "
+    "goal.approved": ("approved_pos", lambda e: None if (e.get("goal") or "").startswith(STANDING) else
+                      f"Goal {e['goal']} was approved (position {e['position']}). "
                       "Start it now: orders, tasks, assignments. Reply in one line with what you created."),
     "task.escalated": ("escalated_pos", lambda e: None if (e.get("data") or {}).get("to") != "chief_of_staff" else
                        f"Task {e['task']} was escalated to you (position {e['position']}, "
@@ -1825,7 +1895,7 @@ def ping_cos_idle(st: dict, chat_cmd: str, state: dict | None = None) -> None:
     idle = st.setdefault("goal_idle", {})   # goal -> {"since", "told"}
     now = time.time()
     for gid, g in goals.items():
-        if g.get("status") != "active" or gid in busy or g.get("escalation"):
+        if g.get("status") != "active" or gid in busy or g.get("escalation") or gid.startswith(STANDING):
             idle.pop(gid, None)
             continue
         p = idle.setdefault(gid, {"since": now, "told": False})

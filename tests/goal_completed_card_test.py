@@ -51,6 +51,7 @@ b.hive = lambda *a: (True, json.dumps({"goal": goals[a[1]]})) if a[0] == "goal" 
     if a[:3] == ("inbox", "--for", "operator") else (True, "[]")
 b.result_text = lambda pin: SUMMARY if pin == PIN else None
 b.ALLOW = {"chat_id": -1, "user_id": 1}
+b.CARDS = -1   # the cards chat is the private chat (no HIVE_CARDS_CHAT)
 b.save_state = lambda st: None
 sent, files = [], []
 b.tg = lambda method, **kw: sent.append((method, kw)) or {"message_id": 77}
@@ -113,7 +114,7 @@ ents = [{"type": "bold", "offset": 0, "length": 5}]
 b.on_callback({"id": "c1", "from": {"id": 1}, "message": {"chat": {"id": -1}, "message_id": 77, "text": "Card.",
                                                           "entities": ents}, "data": "accept:g1"}, {"decided": []})
 m, kw = next(e for e in edits if e[0] == "editMessageText")
-assert kw["entities"] == ents and kw["text"] == "Card.\n\n✅ goal.accepted g1 at position 1835", kw
+assert kw["entities"] == ents and kw["text"] == "Card.\n\n✅ goal.accepted g1 at position 1835 (1)", kw   # (who tapped)
 
 # Other inbox cards are unchanged: a proposed goal shows the goal.
 assert "<b>Result:</b>" not in b.goal_text("g1")

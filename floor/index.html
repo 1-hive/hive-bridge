@@ -234,7 +234,9 @@ function renderBoard() {
 
   const goals = Object.values(S.goals).sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status) || (b.status_since||0) - (a.status_since||0));
   const nowMs = nowAt();
-  $("lanes").innerHTML = goals.length ? goals.map(g => lane(g, nowMs)).join("") : `<div class="calm">No goals in progress.</div>`;
+  // tasks with no goal (a hive without goals, or tasks from before it took goals): a lane of their own
+  const loose = Object.values(S.tasks).some(t => !t.goal) ? [{id: null, title: "Tasks without a goal", status: "active"}] : [];
+  $("lanes").innerHTML = goals.length || loose.length ? goals.concat(loose).map(g => lane(g, nowMs)).join("") : `<div class="calm">No goals in progress.</div>`;
   document.querySelectorAll(".card").forEach(c => c.addEventListener("click", () => openTask(c.dataset.task)));
 }
 
@@ -248,7 +250,7 @@ function lane(g, nowMs) {
     } else budget = `<div class="budget"><span>wall clock</span><div class="bar"><i style="width:0"></i></div><span>${dur(wall)} budget</span></div>`;
   }
   const flags = g.escalation ? `<div class="flags"><span class="flag">escalated to ${esc(g.escalation.to)}: ${esc(g.escalation.reason || g.escalation.code)}</span></div>` : "";
-  const tasks = Object.values(S.tasks).filter(t => t.goal === g.id);
+  const tasks = Object.values(S.tasks).filter(t => (t.goal || null) === (g.id || null));
   if (["accepted", "abandoned"].includes(g.status))
     return `<article class="lane done"><div class="lane-head"><div><div class="gid">${esc(g.id)}${tasks.length ? ` · ${tasks.length} task${tasks.length > 1 ? "s" : ""} closed` : ""}</div><div class="gtitle">${esc(g.title)}</div></div><span class="pill ${esc(g.status)}">${esc(g.status)}</span></div></article>`;
   const cols = tasks.length ? `<div class="cols">${COLS.map(([k, name, sts]) => {

@@ -55,6 +55,7 @@ def hive(*a):
 b.hive = hive
 b.result_text = lambda p: docs.get(p["commit_oid"].split(":")[1])
 b.ALLOW = {"chat_id": -1, "user_id": 1}
+b.CARDS = -1   # the cards chat is the private chat (no HIVE_CARDS_CHAT)
 b.allowed = lambda frm, chat: frm.get("id") == 1
 b.save_state = lambda st: None
 sent, calls = [], []
@@ -81,8 +82,8 @@ assert "🔓 <b>Approving lets its agents read these host files</b>" in c1 and "
 assert "Kev's served run" in c1
 assert "🔓" not in c0 and "⚠️" not in c0, "a goal without inputs: card as before"
 assert "🔓" not in c2, "a budget alert on the goal doesn't list inputs"
-assert st["inputs_shown"] == {"101": [["~/opt/kev/runs/reader-ft-v1", "Kev's served run, for the CPU latency test"]],
-                              "102": []}, st["inputs_shown"]
+assert st["inputs_shown"] == {"-1:101": [["~/opt/kev/runs/reader-ft-v1", "Kev's served run, for the CPU latency test"]],
+                              "-1:102": []}, st["inputs_shown"]   # by chat:message
 
 # Approve, unchanged: approved.
 msg1 = {"chat": {"id": -1}, "message_id": 101, "text": "card"}
@@ -93,7 +94,7 @@ assert emitted and emitted[-1][:4] == ("emit", "goal.approved", "--goal", "g1"),
 emitted.clear()
 sent.clear()
 goals["g1"]["goal_pin"] = pin("p2")
-st2 = {"notified": [], "pending_reason": {}, "inputs_shown": {"101": st["inputs_shown"]["101"]}}
+st2 = {"notified": [], "pending_reason": {}, "inputs_shown": {"101": st["inputs_shown"]["-1:101"]}}   # a card from before: bare id
 b.on_callback({"id": "c2", "from": {"id": 1}, "message": msg1, "data": "approve:g1"}, st2)
 assert not emitted, "not approved"
 assert any(m == "answerCallbackQuery" and "changed" in kw.get("text", "") for m, kw in calls)
@@ -101,9 +102,9 @@ assert any(m == "editMessageReplyMarkup" and kw.get("message_id") == 101 for m, 
 new = sent[-1][1]
 assert "Not approved: its host inputs changed" in new["text"] and "models--Q" in new["text"] and "&lt;model&gt;" in new["text"]
 assert new["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "approve:g1"
-new_id = str(mid[0])
-assert len(st2["inputs_shown"][new_id]) == 2
-b.on_callback({"id": "c3", "from": {"id": 1}, "message": {**msg1, "message_id": int(new_id)}, "data": "approve:g1"}, st2)
+new_id = mid[0]
+assert len(st2["inputs_shown"][f"-1:{new_id}"]) == 2
+b.on_callback({"id": "c3", "from": {"id": 1}, "message": {**msg1, "message_id": new_id}, "data": "approve:g1"}, st2)
 assert emitted and emitted[-1][1] == "goal.approved", "the new card approves"
 
 # A card from before this check, for a goal that now has inputs: refused too (it showed none).

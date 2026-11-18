@@ -77,6 +77,7 @@ b.run_merge = run_merge
 b.result_text = lambda p: "# Summary\n\n## What acceptance means\n\nStage 1 is done.\n"
 b.tg_file = lambda *a, **k: None
 b.ALLOW = {"chat_id": -1, "user_id": 1}
+b.CARDS = -1   # the cards chat is the private chat (no HIVE_CARDS_CHAT)
 b.allowed = lambda frm, chat: frm.get("id") == 1
 b.save_state = lambda st: None
 b.CHAT_CMD = "cos-chat"
@@ -119,7 +120,7 @@ assert kb(cm) == [["acceptmerge:gm"], ["accept:gm", "reopen:gm"]], kb(cm)
 assert "🔀" not in cn["text"] and "accepts itself on" in cn["text"] and kb(cn) == [["reopen:gn"]], (cn["text"], kb(cn))
 assert "isn't merged from here" in cc["text"] and "conflicts in a.txt" in cc["text"] and "merge task" in cc["text"]
 assert kb(cc) == [["accept:gc", "reopen:gc"]], kb(cc)
-assert st["merge_shown"] == {"101": "d1", "102": None, "103": None}, st["merge_shown"]
+assert st["merge_shown"] == {"-1:101": "d1", "-1:102": None, "-1:103": None}, st["merge_shown"]   # by chat:message
 
 # Accept + merge, plan unchanged: merged, then accepted; the note has the outcome; cos is told.
 msg = {"chat": {"id": -1}, "message_id": 101, "text": "card"}
@@ -132,7 +133,7 @@ edit = [kw for m, kw in calls if m == "editMessageText"][-1]
 assert "✅ goal.accepted at position 2300" in edit["text"] and "🔀 Merged: mtg-player main" in edit["text"], edit
 told = chat()
 assert len(told) == 1 and "accepted goal gm and merged goal gm's reviewed code" in told[0][1], told
-assert "101:acceptmerge" in st["decided"]
+assert "-1:101:acceptmerge" in st["decided"]
 # Tapped twice: already done.
 runs.clear()
 b.on_callback({"id": "c1b", "from": {"id": 1}, "message": msg, "data": "acceptmerge:gm"}, st)
@@ -147,7 +148,7 @@ b.on_callback({"id": "c2", "from": {"id": 1}, "message": msg, "data": "acceptmer
 assert not runs and not emitted, (runs, emitted)
 new = sent[-1][1]
 assert "Not merged or accepted: what would be merged changed" in new["text"] and "merge hive/s1-2-ladder" in new["text"]
-assert kb(new)[0] == ["acceptmerge:gm"] and st2["merge_shown"][str(mid[0])] == "d1b", (kb(new), st2["merge_shown"])
+assert kb(new)[0] == ["acceptmerge:gm"] and st2["merge_shown"][f"-1:{mid[0]}"] == "d1b", (kb(new), st2["merge_shown"])
 assert any(m == "editMessageReplyMarkup" and kw.get("message_id") == 101 for m, kw in calls), "old card's buttons go"
 
 # Merging fails: nothing accepted, the card keeps its buttons.
@@ -157,7 +158,7 @@ b.on_callback({"id": "c3", "from": {"id": 1}, "message": newmsg, "data": "accept
 assert runs and not emitted, (runs, emitted)
 said = [kw["text"] for m, kw in calls if m == "sendMessage"][-1]
 assert said.startswith("❌ Not merged or accepted: mtg-player: not merged (main moved)") and "Accept only" in said, said
-assert f"{mid[0]}:acceptmerge" not in st2.get("decided", []), "it can be tapped again"
+assert f"-1:{mid[0]}:acceptmerge" not in st2.get("decided", []), "it can be tapped again"
 run_result["ok"] = True
 
 # Accept only on a mergeable card: accepted, and the status says how to merge later.
@@ -180,7 +181,7 @@ st3 = {"notified": [], "pending_reason": {}, "offset": 0}
 b.on_message({"message_id": 5, "chat": {"id": -1, "type": "private"}, "from": {"id": 1}, "text": "/merge old"}, st3, None)
 card = sent[-1][1]
 assert "🔀 <b>Merge goal old</b> (accepted)" in card["text"] and "merge hive/s0-3-alts" in card["text"], card["text"]
-assert kb(card) == [["merge:old"]] and st3["merge_shown"][str(mid[0])] == "d9", kb(card)
+assert kb(card) == [["merge:old"]] and st3["merge_shown"][f"-1:{mid[0]}"] == "d9", kb(card)
 b.on_callback({"id": "c6", "from": {"id": 1}, "message": {"chat": {"id": -1}, "message_id": mid[0], "text": "c"},
                "data": "merge:old"}, st3)
 assert runs == [("old", "d9", "Telegram: /merge")] and not emitted, (runs, emitted)

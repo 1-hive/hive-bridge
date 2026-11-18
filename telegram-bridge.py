@@ -2124,6 +2124,25 @@ def push_feed(st: dict) -> None:
 
 
 TO_LINE = re.compile(r"^\s*\[\[to:\s*(.+?)\s*\]\]\s*$", re.I)
+MODEL_LINE = re.compile(r"^\s*\[\[model:\s*(.*?)\s*\]\]\s*$", re.I)
+SHOW_MODEL = os.environ.get("HIVE_SHOW_MODEL", "1") != "0"   # "[model]" over what an agent wrote; 0 turns it off
+
+
+def model_tag(model) -> str:
+    """"[claude-opus-5-5]" for a model as an agent's harness reported it ("anthropic/claude-opus-5-5-20261101" too:
+    the provider and a date suffix go); "" when unknown or turned off, so a message is never labelled with a model
+    it may not have come from."""
+    if not SHOW_MODEL or not isinstance(model, str):
+        return ""
+    name = re.sub(r"-latest$", "", re.sub(r"-\d{8}$", "", model.strip().rsplit("/", 1)[-1]))
+    return f"[{name}]" if re.fullmatch(r"[\w.:@+-]{1,64}", name or "") else ""
+
+
+def take_model(reply: str) -> tuple[str, str]:
+    """cos.sh chat's first line "[[model: <model>]]" (the model that wrote the reply), taken off: (tag, the rest)."""
+    first, _, rest = reply.partition("\n")
+    m = MODEL_LINE.match(first)
+    return (model_tag(m.group(1)), rest.lstrip("\n")) if m else ("", reply)
 TASK_LINE = re.compile(r"^\s*\[\[task:\s*([a-z0-9][a-z0-9._-]{0,63})\s*\]\]\s*$", re.I)
 ORIGINS = STATE.parent / "origins.json"   # task -> the chat message it was started from
 
@@ -2502,7 +2521,7 @@ def ask_cos(item: tuple) -> str:
     return reply
 
 
-def deliver(reply: str, target) -> None:
+def deliver(reply: str, target, tag: str = "") -> None:
     reply = take_task_lines(reply, target)
     reply, target = route_reply(reply, target)
     chat_id = (target or {}).get("chat_id") or ALLOW["chat_id"]
@@ -2513,7 +2532,7 @@ def deliver(reply: str, target) -> None:
         log(f"chat: no-op reply not forwarded: {reply[:60]!r}")
         return
     if not is_noop(reply):
-        for i, part in enumerate(chunks(reply)):
+        for i, part in enumerate(chunks(f"{tag}\n{reply}" if tag else reply)):
             safe("sendMessage", chat_id=chat_id, text=part, **(thread if i == 0 else {}))
     notes = send_attachments(found, chat_id)
     if notes:
@@ -2538,7 +2557,7 @@ def chat_step(item: tuple | None) -> None:
         save_cos_limit(lim)
         log("chat: held (chief of staff at a usage limit)")
         return
-    reply = ask_cos(item)
+    tag, reply = take_model(ask_cos(item))
     line = limit_line(reply)
     if line:
         if not lim:
@@ -2563,7 +2582,7 @@ def chat_step(item: tuple | None) -> None:
         log(f"chat: chief of staff back; {len(rest)} more held")
         for h in rest:
             CHAT.put(tuple(h))
-    deliver(reply, item[3])
+    deliver(reply, item[3], tag)
 
 
 def chat_worker() -> None:

@@ -71,7 +71,34 @@ def main():
     answer["text"] = "[[model: claude-opus-5-5]]\nOff."
     b.chat_step(("cos chat", "andy: hi", True, None))
     assert sent == [(1, "Off.", None)], sent
-    print("PASSED: the chief of staff's replies carry [model] when cos.sh says which; untagged when it doesn't")
+    b.SHOW_MODEL = True
+
+    # A worker's question and result: the model the record event names (hive-record A7, data.ext.model)
+    assert b.event_model_tag({"data": {"ext": {"model": "claude-opus-5-5"}}}) == "[claude-opus-5-5]"
+    assert b.event_model_tag({"data": {"ext": {"cost": {}}}}) == "" and b.event_model_tag(None) == ""
+    sent.clear()
+    b.result_text = lambda pin: ""
+    origin = {"chat_id": -100, "message_id": 5}
+    blocked = {"actor": {"id": "worker.claude.1"}, "position": 9,
+               "data": {"needs": "decision", "reason": "Which API?", "ext": {"model": "claude-sonnet-5-5"}}}
+    b.send_question("t1", origin, blocked)
+    assert sent[0][1].startswith("[claude-sonnet-5-5]\n❓ claude.1 needs a decision on t1"), sent
+    sent.clear()
+    b.send_question("t1", origin, {**blocked, "data": {"needs": "decision", "reason": "Which API?"}})
+    assert sent[0][1].startswith("❓ claude.1 needs"), sent
+
+    import json
+    calls = []
+    b.tg = lambda method, **p: calls.append((method, p)) or {}
+    b.tg_file = lambda *a, **p: calls.append(("file", p)) or {}
+    b.result_text = lambda pin: "## Summary\nIt works.\n\n## Details\n..."
+    res = {"event_id": "e1", "type": "task.result_posted", "refs": [],
+           "data": {"ext": {"model": "anthropic/claude-opus-5-5-20261101"}}}
+    b.hive = lambda *a: (True, json.dumps({"task": {"current_result": {"event_id": "e1", "pin": {}}}, "events": [res]}))
+    b.send_result("t1", origin)
+    assert calls[0][0] == "sendMessage" and calls[0][1]["text"].startswith("[claude-opus-5-5]\nt1: done. Summary:"), calls
+    print("PASSED: the chief of staff's replies, and workers' questions and results, carry [model] when it is known; "
+          "untagged when it isn't")
 
 
 if __name__ == "__main__":

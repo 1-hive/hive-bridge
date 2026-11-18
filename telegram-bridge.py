@@ -2218,6 +2218,12 @@ def model_tag(model) -> str:
     return f"[{name}]" if re.fullmatch(r"[\w.:@+-]{1,64}", name or "") else ""
 
 
+def event_model_tag(e) -> str:
+    """"[<model>]" for a record event that names the model that wrote it (hive-record A7, data.ext.model); ""."""
+    ext = ((e or {}).get("data") or {}).get("ext") if isinstance(e, dict) else None
+    return model_tag(ext.get("model")) if isinstance(ext, dict) else ""
+
+
 def take_model(reply: str) -> tuple[str, str]:
     """cos.sh chat's first line "[[model: <model>]]" (the model that wrote the reply), taken off: (tag, the rest)."""
     first, _, rest = reply.partition("\n")
@@ -2387,6 +2393,8 @@ def send_question(task: str, origin: dict, e: dict, st: dict | None = None) -> N
         text = (f"{head}\n\n{body}\n\n"
                 + ("The full question, with options and evidence, is in the file below. " if full else "")
                 + "The chief of staff answers it, or brings it to you.")
+    tag = event_model_tag(e)   # the model that wrote the question (record A7)
+    text = f"{tag}\n{text}" if tag else text
     reply = {"reply_to_message_id": origin.get("status_id") or origin["message_id"], "allow_sending_without_reply": True}
     for i, part in enumerate(chunks(text)):
         m = safe("sendMessage", chat_id=origin["chat_id"], text=part, disable_web_page_preview=True, **(reply if i == 0 else {}))
@@ -2558,9 +2566,12 @@ def send_result(task: str, origin: dict) -> None:
     label = "Summary:" if found else "The report has no summary; it starts:"
     caption = f"{task}: the full report" + (f"; code: {', '.join(code)}" if code else "")
 
+    tag = event_model_tag(res)   # the model that wrote the result (record A7)
+
     def deliver(chat_id, reply_to, note=""):
         reply = {"reply_to_message_id": reply_to, "allow_sending_without_reply": "true"} if reply_to else {}
-        tg("sendMessage", chat_id=chat_id, text=f"{task}: done{note}. {label}\n\n{summary}", disable_web_page_preview=True, **reply)
+        tg("sendMessage", chat_id=chat_id, text=(f"{tag}\n" if tag else "") + f"{task}: done{note}. {label}\n\n{summary}",
+           disable_web_page_preview=True, **reply)
         tg_file("sendDocument", "document", f, chat_id=chat_id, caption=f"{caption}{note}"[:1000], **reply)
 
     try:

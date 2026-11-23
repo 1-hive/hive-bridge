@@ -91,6 +91,14 @@ def test_idle_wake(b) -> None:
     assert run(60) == [] and "g1" not in st["goal_idle"], "a task opening ends the spell"
     state["tasks"]["t2"]["status"] = "done"
     assert run(60) == [] and run(30 * 60) and run(60) == [], "the next spell is told again, once"
+    # a task created but never assigned isn't work going on (proto-hive, 2026-11-22: a goal sat two days on three)
+    state["tasks"]["t2"]["status"] = "in_progress"
+    assert run(60) == []
+    state["tasks"]["t2"]["status"] = "done"
+    state["tasks"]["t3"] = {"id": "t3", "goal": "g1", "status": "created"}
+    got = run(60) + run(30 * 60)
+    assert len(got) == 1 and "(t3 created, not assigned)" in got[0], got
+    del state["tasks"]["t3"]
     state["goals"]["g1"]["status"] = "completed"
     assert run(60) == [] and st["goal_idle"] == {}
     b.IDLE_GOAL_S = 0
@@ -106,9 +114,9 @@ def test_digest(b, tmp: Path, ws: Path) -> None:
                                         "proposed_at": "2026-11-19T00:00:00Z", "escalation": None,
                                         "budget": {"wall_clock_seconds": 2419200}, "spent": {}}},
              "tasks": {"s2-1": {"id": "s2-1", "goal": "stage2-learn", "title": "Imitation pilot", "status": "done",
-                                "status_since": "2026-11-12T10:00:00Z"},
+                                "status_since": 120},
                        "s2-2": {"id": "s2-2", "goal": "stage2-learn", "title": "Self-play pilot", "status": "done",
-                                "status_since": "2026-11-13T09:00:00Z"}}}
+                                "status_since": 130}}}   # a record position, as the record keeps it
     b.hive = lambda *a: (True, json.dumps(state)) if a[0] == "state" else (True, "")
     sent = []
     b.tg = lambda method, **p: sent.append(p["text"]) or {}
@@ -121,13 +129,13 @@ def test_digest(b, tmp: Path, ws: Path) -> None:
     assert "done since the last digest (2): Imitation pilot; Self-play pilot" in text, text
     assert "Decided (goal log):" in text and "imitation pilot first" in text and "self-play next" in text, text
     assert "not this goal's log" not in text, "only this goal's log, not one whose name ends the same"
-    assert "⏸ no open task since" in text, text
+    assert "⏸ nothing worked on since" in text, text
     assert st["log_shown"] == {"stage2-learn": 2} and "log_next" not in st
     # the next digest: only the lines added since, and only tasks done since
     workspace_with_log(tmp, ws, lines + ["- 2026-11-13 08:00 2b: league with past selves, not xmage:10 (cost; s2-2)"])
     state["tasks"]["s2-3"] = {"id": "s2-3", "goal": "stage2-learn", "title": "League run", "status": "in_progress"}
     clock[0] += 86400
-    st["digest_at"] = b.dt.datetime(2026, 11, 14, tzinfo=b.dt.timezone.utc).timestamp()   # after s2-1 and s2-2 were done
+    st["digest_pos"] = 200   # after s2-1 and s2-2 were done
     b.send_digest(st)
     text = sent[-1]
     assert "league with past selves" in text and "imitation pilot first" not in text, text
@@ -229,8 +237,20 @@ def test_decided_tap() -> None:
     assert ok and "Record task.answered on t-1" in cos, "an undecided card asks for task.answered, as before"
 
 
+def test_loop_steps(b) -> None:
+    """A step that raises is logged with where, and the loop's other steps still run (2026-11-20: a digest that
+    raised before everything else froze the bridge for 38 hours)."""
+    logged = []
+    b.log = logged.append
+    assert b.step("digest", lambda: {}["x"]) is False
+    assert len(logged) == 1 and logged[0].startswith("error in digest (goal_runs_on_test.py:") and "KeyError" in logged[0], logged
+    ran = []
+    assert b.step("inbox", ran.append, 1) is True and ran == [1]
+
+
 def main():
     b, tmp, ws = load()
+    test_loop_steps(b)
     test_idle_wake(b)
     test_digest(b, tmp, ws)
     test_questions(b)

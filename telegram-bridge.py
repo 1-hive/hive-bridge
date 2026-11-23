@@ -79,6 +79,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -873,6 +874,7 @@ def push_inbox(st: dict) -> None:
 
 DIGEST_AT = (8, 0)
 OPEN = ("assigned", "in_progress", "blocked", "in_review", "created")
+WORKING = tuple(s for s in OPEN if s != "created")   # a task created but not yet assigned is open, not being worked on
 
 
 def next_digest(after: float) -> dt.datetime:
@@ -963,7 +965,6 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     tasks_by_goal: dict = {}
     for t in state.get("tasks", {}).values():
         tasks_by_goal.setdefault(t.get("goal"), []).append(t)
-    since_iso = dt.datetime.fromtimestamp(st.get("digest_at", 0), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     log_next = st["log_next"] = {}   # each goal's log lines shown in this digest: send_digest keeps them once it's sent
     lines = [f"📊 <b>{hp.HIVE_ID} digest</b> · {dt.datetime.now().astimezone():%a %d %b %H:%M}",
              f"{len(events)} events since the last digest (now at position {head})."]
@@ -984,13 +985,14 @@ def digest_text(st: dict) -> tuple[str, int] | None:
         if g.get("escalation"):
             line += f"\n  ⚠️ escalated to {g['escalation'].get('to')}: {esc(g['escalation'].get('reason', ''))}"
         if g["status"] == "active":
-            done = [t for t in ts_ if t["status"] == "done" and (t.get("status_since") or "")[:19] >= since_iso]
+            # status_since is the record position of the task's last status change, not a time
+            done = [t for t in ts_ if t["status"] == "done" and (t.get("status_since") or 0) > since]
             if done:
                 line += f"\n  done since the last digest ({len(done)}): " + "; ".join(esc(t.get("title") or t["id"]) for t in done[:8])
                 line += f"; … and {len(done) - 8} more" if len(done) > 8 else ""
             idle = (st.get("goal_idle") or {}).get(g["id"])
-            if not open_ and idle:
-                line += f"\n  ⏸ no open task since {dt.datetime.fromtimestamp(idle['since']).astimezone():%a %H:%M}"
+            if idle and not any(t["status"] in WORKING for t in open_):
+                line += f"\n  ⏸ nothing worked on since {dt.datetime.fromtimestamp(idle['since']).astimezone():%a %H:%M}"
             log_lines = goal_log(g["id"])
             new = log_lines[(st.get("log_shown") or {}).get(g["id"], 0):]
             log_next[g["id"]] = len(log_lines)
@@ -1016,6 +1018,22 @@ def digest_text(st: dict) -> tuple[str, int] | None:
     nxt = next_digest(time.time())
     lines.append(f"\nNext digest: {nxt:%a %d %b %H:%M}. If none arrives by then, the bridge or the record is down.")
     return "\n".join(lines), head
+
+
+DIGEST_RETRY_S = 600
+
+
+def step(name: str, fn, *args) -> bool:
+    """One step of the main loop, on its own: an error is logged with where it happened, and the other steps still
+    run. On 2026-11-20 a digest that couldn't be built raised before everything else in the loop, every 10 seconds
+    for 38 hours: no cards, no pings to the chief of staff, no messages read."""
+    try:
+        fn(*args)
+        return True
+    except Exception as e:
+        where = traceback.extract_tb(e.__traceback__)[-1]
+        log(f"error in {name} ({Path(where.filename).name}:{where.lineno}): {type(e).__name__}: {e}")
+        return False
 
 
 def send_digest(st: dict) -> None:
@@ -1882,16 +1900,23 @@ def goal_state() -> dict | None:
 
 
 def ping_cos_idle(st: dict, chat_cmd: str, state: dict | None = None) -> None:
-    """Tell the chief of staff once when an active goal has had no open task for IDLE_GOAL_S, unless the goal waits on
-    the operator (escalated, e.g. over budget). A task opening ends the spell; the next spell is told again. The time
-    is counted from when the bridge first saw the goal idle, so a restart only delays it."""
+    """Tell the chief of staff once when an active goal has had no task worked on for IDLE_GOAL_S, unless the goal waits
+    on the operator (escalated, e.g. over budget). A task created but never assigned is not work going on (proto-hive,
+    2026-11-22: a goal sat two days on three of them, and the old count of open tasks kept the wake quiet). A task
+    being worked on ends the spell; the next spell is told again. The time is counted from when the bridge first saw
+    the goal idle, so a restart only delays it."""
     if not IDLE_GOAL_S:
         return
     state = state if state is not None else goal_state()
     if state is None:
         return
     goals = state.get("goals") or {}
-    busy = {t.get("goal") for t in (state.get("tasks") or {}).values() if t.get("status") in OPEN}
+    tasks = list((state.get("tasks") or {}).values())
+    busy = {t.get("goal") for t in tasks if t.get("status") in WORKING}
+    unassigned: dict = {}
+    for t in tasks:
+        if t.get("status") == "created":
+            unassigned.setdefault(t.get("goal"), []).append(t.get("id"))
     idle = st.setdefault("goal_idle", {})   # goal -> {"since", "told"}
     now = time.time()
     for gid, g in goals.items():
@@ -1901,8 +1926,11 @@ def ping_cos_idle(st: dict, chat_cmd: str, state: dict | None = None) -> None:
         p = idle.setdefault(gid, {"since": now, "told": False})
         if not p["told"] and now - p["since"] >= IDLE_GOAL_S:
             p["told"] = True
-            CHAT.put((chat_cmd, f"Goal {gid} (\"{g.get('title', '')}\") is active, and none of its tasks has been open "
-                                f"for {int((now - p['since']) // 60)} min. Run it on as your doc says (Running a goal): "
+            waiting = unassigned.get(gid) or []
+            held = (f" ({', '.join(waiting[:5])}{' and more' if len(waiting) > 5 else ''} created, not assigned)"
+                    if waiting else "")
+            CHAT.put((chat_cmd, f"Goal {gid} (\"{g.get('title', '')}\") is active, and none of its tasks has been worked "
+                                f"on for {int((now - p['since']) // 60)} min{held}. Run it on as your doc says (Running a goal): "
                                 "start its next work, or complete it if its success criteria are met or shown out of "
                                 "reach, and log what you decided in its goal log. Reply with nothing unless the human "
                                 "must do something before it can go on; then say what, in one line.", False, None))
@@ -2863,29 +2891,30 @@ def main() -> None:
     threading.Thread(target=chat_worker, daemon=True).start()
     set_menu_button()
     log("bridge up")
-    next_inbox = next_idle = 0.0
+    next_inbox = next_idle = digest_retry = 0.0
     while True:
         try:
-            # The first run sends one now; afterwards, at each digest time.
-            if time.time() >= next_digest(st.get("digest_at", 0)).timestamp():
-                send_digest(st)
+            # The first run sends one now; afterwards, at each digest time. One that fails is tried again in 10 min.
+            if time.time() >= max(next_digest(st.get("digest_at", 0)).timestamp(), digest_retry):
+                if not step("digest", send_digest, st):
+                    digest_retry = time.time() + DIGEST_RETRY_S
             if time.time() >= next_inbox:
-                push_inbox(st)
+                step("inbox", push_inbox, st)
                 if not a.no_feed:
-                    push_feed(st)
+                    step("feed", push_feed, st)
                 if CHATS:
-                    push_origins(st)
-                    push_status(st)
-                push_repo_requests(st)
-                relay_floor_alerts(st)
+                    step("origins", push_origins, st)
+                    step("status", push_status, st)
+                step("repo requests", push_repo_requests, st)
+                step("floor alerts", relay_floor_alerts, st)
                 if a.chat_cmd:
-                    ping_cos(st, a.chat_cmd)
-                    check_followups(a.chat_cmd)
+                    step("cos pings", ping_cos, st, a.chat_cmd)
+                    step("followups", check_followups, a.chat_cmd)
                     if time.time() >= next_idle:
-                        ping_cos_idle(st, a.chat_cmd)
+                        step("idle goals", ping_cos_idle, st, a.chat_cmd)
                         next_idle = time.time() + IDLE_CHECK_S
                     if BOARD_BOTS:
-                        ping_cos_trouble(st, a.chat_cmd)
+                        step("trouble", ping_cos_trouble, st, a.chat_cmd)
                 next_inbox = time.time() + a.inbox_every
             for u in tg("getUpdates", offset=st["offset"], timeout=a.poll, allowed_updates=["message", "callback_query"]):
                 st["offset"] = u["update_id"] + 1

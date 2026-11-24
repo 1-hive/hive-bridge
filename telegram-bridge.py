@@ -700,30 +700,119 @@ def on_pr_merge(cq: dict, st: dict, k: str) -> None:
         return
     who = sender_name(frm)
     safe("answerCallbackQuery", callback_query_id=cq["id"], text="merging…")
-    try:
-        r = subprocess.run([*PR_MERGE_CMD.split(), pr["url"], pr["sha"]], capture_output=True, text=True, timeout=120)
-        out = json.loads(((r.stdout or "").strip().splitlines() or ["{}"])[-1])
-    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
-        out = {"ok": False, "why": f"couldn't run the merge: {e}"}
-    reply = {"reply_to_message_id": mid, "allow_sending_without_reply": "true", "disable_web_page_preview": "true"}
+    out = run_pr_merge(pr)
     if not (out.get("ok") or out.get("already")):
         log(f"PR merge {pr['url']} ({who}): not merged: {out.get('why')}")
-        safe("sendMessage", chat_id=chat, text=f"❌ Not merged ({who} tapped): {out.get('why') or 'no reason given'}", **reply)
+        safe("sendMessage", chat_id=chat, text=f"❌ Not merged ({who} tapped): {out.get('why') or 'no reason given'}",
+             **pr_reply(mid))
         return
-    done[k] = {"by": who, "at": time.time(), "sha": out.get("merged_sha")}
-    for old in sorted(done, key=lambda x: done[x]["at"])[:-300]:
-        del done[old]
-    save_state(st)
-    for c, m in {(c, m) for c, m in pr.get("messages") or []} | {(chat, mid)}:   # every copy of the message
-        safe("editMessageReplyMarkup", chat_id=c, message_id=m, reply_markup={"inline_keyboard": []})
-    line = (f"🔀 Merged by {who} into {out.get('base') or 'its base branch'} (merge commit "
-            f"{str(out.get('merged_sha'))[:10]}): {pr['url']}" if out.get("ok") else f"🔀 Already merged: {pr['url']}")
-    safe("sendMessage", chat_id=chat, text=line, **reply)
-    log(f"PR merge {pr['url']} ({who}): {line}")
+    pr_merged(st, k, pr, out, who, chat, mid)
     if out.get("ok") and CHAT_CMD:
         CHAT.put((CHAT_CMD, f"{who} (operator) merged the pull request of task {pr.get('task') or '?'} on GitHub: "
                   f"{pr['url']}, into {out.get('base')} (merge commit {out.get('merged_sha')}). The hive copy's main "
                   "follows it within minutes, and new work branches from there. No reply needed.", False, None))
+
+
+def pr_reply(mid) -> dict:
+    return {**({"reply_to_message_id": mid} if mid else {}), "allow_sending_without_reply": "true",
+            "disable_web_page_preview": "true"}
+
+
+def run_pr_merge(pr: dict) -> dict:
+    try:
+        r = subprocess.run([*PR_MERGE_CMD.split(), pr["url"], pr["sha"]], capture_output=True, text=True, timeout=120)
+        return json.loads(((r.stdout or "").strip().splitlines() or ["{}"])[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return {"ok": False, "why": f"couldn't run the merge: {e}"}
+
+
+def pr_merged(st: dict, k: str, pr: dict, out: dict, who: str, chat, mid, say: bool = True, how: str = "") -> None:
+    """A merged pull request (or one found merged already): remember it, clear the 🔀 button on every copy of its
+    message, and say so in reply to the one at (chat, mid)."""
+    done = st.setdefault("prs_merged", {})
+    done[k] = {"by": who, "at": time.time(), "sha": out.get("merged_sha")}
+    for old in sorted(done, key=lambda x: done[x]["at"])[:-300]:
+        del done[old]
+    save_state(st)
+    clear_pr_buttons(pr, chat, mid)
+    line = (f"🔀 Merged {how or 'by ' + who} into {out.get('base') or 'its base branch'} (merge commit "
+            f"{str(out.get('merged_sha'))[:10]}): {pr['url']}" if out.get("ok") else f"🔀 Already merged: {pr['url']}")
+    if say:
+        safe("sendMessage", chat_id=chat, text=line, **pr_reply(mid))
+    log(f"PR merge {pr['url']} ({who}): {line}")
+
+
+def clear_pr_buttons(pr: dict, chat=None, mid=None) -> None:
+    for c, m in {(c, m) for c, m in pr.get("messages") or []} | ({(chat, mid)} if mid else set()):   # every copy
+        safe("editMessageReplyMarkup", chat_id=c, message_id=m, reply_markup={"inline_keyboard": []})
+
+
+# Merging on an operator's standing order: HIVE_AUTO_MERGE_REPOS (owner/name, comma-separated, or *) are the GitHub
+# homes whose reviewed pull requests the bridge merges itself once published, oldest first, as if HIVE_AUTO_MERGE_BY
+# had tapped 🔀 Merge (the same command; only while the head is still the reviewed commit). proto-hive, 2026-11-24:
+# each PR left waiting made the next ones conflict and need a rebase. A refusal is tried again (AUTO_MERGE_TRIES, every
+# AUTO_MERGE_RETRY_S) unless it can't change (closed, merged, its head moved); then the chat and the chief
+# of staff are told once, so a conflicting one is rebased and published again, and that new one merges.
+AUTO_MERGE = {r.strip().lower() for r in os.environ.get("HIVE_AUTO_MERGE_REPOS", "").split(",") if r.strip()}
+AUTO_MERGE_BY = os.environ.get("HIVE_AUTO_MERGE_BY", "the operator")
+AUTO_MERGE_DAYS, AUTO_MERGE_TRIES, AUTO_MERGE_RETRY_S, AUTO_MERGE_PER_STEP = 14, 3, 600, 4
+AUTO_MERGE_FINAL = ("it was already merged", "it was closed", "its head is now", "its head moved", "its branch",
+                    "not a GitHub")   # "GitHub won't merge it" (405) is tried again: it can be main moving meanwhile
+PR_HOME = re.compile(r"github\.com/([^/]+/[^/]+)/pull/\d+$", re.I)
+
+
+def auto_merge_prs(st: dict) -> None:
+    if not (AUTO_MERGE and PR_MERGE_CMD):
+        return
+    try:
+        prs = json.loads(PRS.read_text())
+    except (OSError, ValueError):
+        return
+    done, tried, now, ran = st.setdefault("prs_merged", {}), st.setdefault("auto_merge", {}), time.time(), 0
+    for k, pr in sorted(prs.items(), key=lambda kv: kv[1].get("at") or 0):
+        home = PR_HOME.search(pr.get("url") or "")
+        if (k in done or not home or not pr.get("sha") or now - (pr.get("at") or 0) > AUTO_MERGE_DAYS * 86400
+                or ("*" not in AUTO_MERGE and home.group(1).lower() not in AUTO_MERGE)):
+            continue
+        t = tried.get(k) if (tried.get(k) or {}).get("sha") == pr["sha"] else {"sha": pr["sha"], "n": 0, "at": 0}
+        if t["n"] >= AUTO_MERGE_TRIES or now - t["at"] < AUTO_MERGE_RETRY_S:
+            continue
+        if ran >= AUTO_MERGE_PER_STEP:
+            break
+        ran += 1
+        out = run_pr_merge(pr)
+        chat, mid = ((pr.get("messages") or [[CARDS, None]])[0] + [None])[:2]
+        if out.get("ok") or out.get("already"):
+            tried.pop(k, None)
+            pr_merged(st, k, pr, out, f"{AUTO_MERGE_BY}'s standing order", chat, mid, say=bool(out.get("ok")),
+                      how=f"automatically, on {AUTO_MERGE_BY}'s standing order,")
+            if out.get("ok") and CHAT_CMD:
+                CHAT.put((CHAT_CMD, f"Merged automatically on {AUTO_MERGE_BY}'s standing order (operator: every reviewed "
+                          f"pull request of {', '.join(sorted(AUTO_MERGE))} is merged once published, oldest first): "
+                          f"the pull request of task {pr.get('task') or '?'}, {pr['url']}, into {out.get('base')} "
+                          f"(merge commit {out.get('merged_sha')}). The hive copy's main follows it within minutes, and "
+                          "new work branches from there. No reply needed.", False, None))
+            continue
+        why = str(out.get("why") or "no reason given")
+        t.update(n=AUTO_MERGE_TRIES if why.startswith(AUTO_MERGE_FINAL) else t["n"] + 1, at=now, why=why)
+        tried[k] = t
+        log(f"auto-merge {pr['url']}: not merged (try {t['n']}): {why}")
+        if t["n"] < AUTO_MERGE_TRIES:
+            continue
+        if why.startswith("it was closed"):   # superseded by a later pull request: nothing to say
+            clear_pr_buttons(pr)
+            continue
+        safe("sendMessage", chat_id=chat, text=f"❌ Not merged automatically: {why}\n{pr['url']}\n"
+             "The chief of staff is told; once it's fixed and published again, the new pull request merges by itself.",
+             **pr_reply(mid))
+        if CHAT_CMD:
+            CHAT.put((CHAT_CMD, f"The pull request of task {pr.get('task') or '?'} ({pr['url']}) couldn't be merged "
+                      f"automatically on {AUTO_MERGE_BY}'s standing order: {why}. If it conflicts with main, have it "
+                      "rebased and published again; the new pull request merges by itself. No reply needed.",
+                      False, None))
+    for old in sorted(tried, key=lambda x: tried[x]["at"])[:-300]:
+        del tried[old]
+    save_state(st)
 
 
 def budget_kb(item: dict) -> list:
@@ -2906,6 +2995,7 @@ def main() -> None:
                     step("origins", push_origins, st)
                     step("status", push_status, st)
                 step("repo requests", push_repo_requests, st)
+                step("auto-merge", auto_merge_prs, st)
                 step("floor alerts", relay_floor_alerts, st)
                 if a.chat_cmd:
                     step("cos pings", ping_cos, st, a.chat_cmd)

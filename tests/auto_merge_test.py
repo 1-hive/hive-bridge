@@ -7,8 +7,10 @@
   afterwards says it's merged already.
 - Found merged already (merged on GitHub by hand): remembered and its buttons cleared, nothing said.
 - Closed (superseded): buttons cleared, nothing said, not tried again.
-- Refused (e.g. 405 while main moves, or a conflict): tried again every 10 min, 3 tries; then the chat and the chief of
+- Refused (e.g. 405 "Merge already in progress"): tried again every 10 min, 3 tries; then the chat and the chief of
   staff are told once and it's left alone. A new reviewed commit for the same pull request starts over.
+- A conflict with main (v0.5.52): said at once, its 🔀 cleared (on one given up on before, too), the chief of staff
+  asked once to have it rebased; a tap on one says the same (asked once per commit); a tap on a closed one clears it.
 
     python3 tests/auto_merge_test.py
 """
@@ -132,6 +134,57 @@ assert calls[-1][1]["text"] == "already merged" and len(merged_args()) == 8, "a 
 b.AUTO_MERGE = {"*"}
 b.auto_merge_prs(st)
 assert merged_args()[-1].startswith(url("x/y", 3)), "* takes every repository"
+# v0.5.52: a conflict with main is told at once (not after 3 tries) and its 🔀 cleared: a tap can't merge it either
+b.AUTO_MERGE = {"o/r"}
+prs.update({
+    "k12": {"url": url("o/r", 12), "sha": SHA[9][:40], "task": "t-12", "at": now - 400, "messages": [[-50, 1201], [-1, 1202]]},
+    "k13": {"url": url("o/r", 13), "sha": SHA[10][:40], "task": "t-13", "at": now - 300, "messages": [[-50, 1301]]},
+    "k14": {"url": url("x/y", 14), "sha": SHA[11][:40], "task": "t-14", "at": now - 200, "messages": [[-50, 1401]]},
+    "k15": {"url": url("x/y", 15), "sha": SHA[12][:40], "task": "t-15", "at": now - 100, "messages": [[-50, 1501]]},
+})
+b.PRS.write_text(json.dumps(prs))
+CONFLICT = {"ok": False, "why": "GitHub won't merge it: Pull Request has merge conflicts"}
+results.write_text(json.dumps({**json.loads(results.read_text()), url("o/r", 12): CONFLICT, url("x/y", 14): CONFLICT,
+                               url("x/y", 15): {"ok": False, "why": "it was closed (e.g. a later pull request superseded it)"}}))
+st["auto_merge"]["k13"] = {"sha": SHA[10][:40], "n": 3, "at": now - 5000, "why": CONFLICT["why"]}   # given up on by v0.5.51
+calls.clear(); chat()
+n0 = len(merged_args())
+b.auto_merge_prs(st)
+assert [a.split()[0] for a in merged_args()[n0:]] == [url("o/r", 12)], merged_args()[n0:]
+said = [(kw["chat_id"], kw.get("reply_to_message_id"), kw["text"]) for m, kw in calls if m == "sendMessage"]
+assert len(said) == 1 and said[0][:2] == (-50, 1201) and said[0][2].startswith(
+    "❌ Not merged automatically: it conflicts with main") and "is asked to have it redone" in said[0][2] \
+    and "merges by itself" in said[0][2], said
+cleared = sorted((kw["chat_id"], kw["message_id"]) for m, kw in calls if m == "editMessageReplyMarkup")
+assert cleared == [(-50, 1201), (-50, 1301), (-1, 1202)], cleared
+told = chat()
+assert len(told) == 1 and "task t-12" in told[0][1] and "rebased onto main" in told[0][1] and "standing order" in told[0][1], told
+calls.clear()
+st["auto_merge"]["k12"]["at"] -= 3600
+b.auto_merge_prs(st)
+assert len(merged_args()) == n0 + 1 and not calls and not chat(), "a conflict isn't tried again, nor said again"
+
+
+def tap(mid, k):
+    calls.clear()
+    b.on_pr_merge({"id": f"t{mid}", "from": {"id": 1}, "message": {"chat": {"id": -50}, "message_id": mid}}, st, k)
+    return ([kw["text"] for m, kw in calls if m == "sendMessage"],
+            sorted((kw["chat_id"], kw["message_id"]) for m, kw in calls if m == "editMessageReplyMarkup"))
+
+
+said, cleared = tap(1401, "k14")
+assert len(said) == 1 and said[0].startswith("❌ Not merged (andy tapped): it conflicts with main") and \
+    "is asked to have it redone" in said[0] and "tap 🔀 on the new pull request" in said[0], said
+assert cleared == [(-50, 1401)], cleared
+told = chat()
+assert len(told) == 1 and "task t-14" in told[0][1] and "an operator merges the new one" in told[0][1], told
+said, cleared = tap(1401, "k14")
+assert "is already having it redone" in said[0] and not chat(), "the chief of staff is asked once per commit"
+said, cleared = tap(1501, "k15")
+assert said == ["❌ Not merged (andy tapped): it was closed (e.g. a later pull request superseded it)"] and \
+    cleared == [(-50, 1501)], (said, cleared)
+
 print("PASSED: standing-order merges: off by default; named repositories only, last 14 days, oldest first, 4 a step; "
       "merged ones said, buttons cleared, chief of staff told; already merged and closed quietly; refusals 3 tries "
-      "then said once; a new reviewed commit starts over; a tap afterwards says it's merged")
+      "then said once; a new reviewed commit starts over; a tap afterwards says it's merged; conflicts said at once, "
+      "buttons cleared, the chief of staff asked once, by tap or not")

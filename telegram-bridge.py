@@ -702,9 +702,14 @@ def on_pr_merge(cq: dict, st: dict, k: str) -> None:
     safe("answerCallbackQuery", callback_query_id=cq["id"], text="merging…")
     out = run_pr_merge(pr)
     if not (out.get("ok") or out.get("already")):
-        log(f"PR merge {pr['url']} ({who}): not merged: {out.get('why')}")
-        safe("sendMessage", chat_id=chat, text=f"❌ Not merged ({who} tapped): {out.get('why') or 'no reason given'}",
-             **pr_reply(mid))
+        why = str(out.get("why") or "no reason given")
+        log(f"PR merge {pr['url']} ({who}): not merged: {why}")
+        if merge_conflict(why):
+            pr_conflict(st, k, pr, chat, mid, f"❌ Not merged ({who} tapped)")
+            return
+        if why.startswith("it was closed"):   # superseded: its button can't do anything any more
+            clear_pr_buttons(pr, chat, mid)
+        safe("sendMessage", chat_id=chat, text=f"❌ Not merged ({who} tapped): {why}", **pr_reply(mid))
         return
     pr_merged(st, k, pr, out, who, chat, mid)
     if out.get("ok") and CHAT_CMD:
@@ -747,17 +752,52 @@ def clear_pr_buttons(pr: dict, chat=None, mid=None) -> None:
         safe("editMessageReplyMarkup", chat_id=c, message_id=m, reply_markup={"inline_keyboard": []})
 
 
+def merge_conflict(why) -> bool:
+    return "merge conflict" in str(why or "").lower()
+
+
+def auto_merges(pr: dict) -> bool:
+    home = PR_HOME.search(pr.get("url") or "")
+    return bool(AUTO_MERGE and PR_MERGE_CMD and home and ("*" in AUTO_MERGE or home.group(1).lower() in AUTO_MERGE))
+
+
+def pr_conflict(st: dict, k: str, pr: dict, chat, mid, head: str) -> None:
+    """A reviewed pull request that conflicts with main (v0.5.52): neither a tap nor a retry can merge it. Said in reply
+    to its message, its 🔀 buttons cleared, and the chief of staff asked once per reviewed commit to have it redone on
+    top of main; the new pull request merges by itself under a standing order, or gets its own 🔀."""
+    tried = st.setdefault("auto_merge", {})
+    t = tried.get(k) if (tried.get(k) or {}).get("sha") == pr["sha"] else {"sha": pr["sha"]}
+    told = t.get("told")
+    t.update(n=AUTO_MERGE_TRIES, at=time.time(), why="it conflicts with main", told=True, cleared=True)
+    tried[k] = t
+    for old in sorted(tried, key=lambda x: tried[x].get("at") or 0)[:-300]:
+        del tried[old]
+    save_state(st)
+    clear_pr_buttons(pr, chat, mid)
+    nxt = "the new pull request merges by itself" if auto_merges(pr) else "then tap 🔀 on the new pull request"
+    safe("sendMessage", chat_id=chat, text=f"{head}: it conflicts with main (pull requests merged since it was "
+         f"written changed the same lines), so tapping again can't merge it.\n{pr['url']}\nThe chief of staff "
+         f"{'is already having it redone' if told else 'is asked to have it redone'} on top of main; {nxt}.",
+         **pr_reply(mid))
+    if CHAT_CMD and not told:
+        CHAT.put((CHAT_CMD, f"The pull request of task {pr.get('task') or '?'} ({pr['url']}) conflicts with main, so "
+                  "GitHub won't merge it. Have it rebased onto main and published again (with a Supersedes line, so "
+                  "this one is closed); " + (f"the new pull request merges by itself on {AUTO_MERGE_BY}'s standing order"
+                  if auto_merges(pr) else "an operator merges the new one") + ". No reply needed.", False, None))
+
+
 # Merging on an operator's standing order: HIVE_AUTO_MERGE_REPOS (owner/name, comma-separated, or *) are the GitHub
 # homes whose reviewed pull requests the bridge merges itself once published, oldest first, as if HIVE_AUTO_MERGE_BY
 # had tapped 🔀 Merge (the same command; only while the head is still the reviewed commit). proto-hive, 2026-11-24:
 # each PR left waiting made the next ones conflict and need a rebase. A refusal is tried again (AUTO_MERGE_TRIES, every
 # AUTO_MERGE_RETRY_S) unless it can't change (closed, merged, its head moved); then the chat and the chief
-# of staff are told once, so a conflicting one is rebased and published again, and that new one merges.
+# of staff are told once. A conflict with main is told at once (v0.5.52) and its 🔀 cleared, as a tap can't merge it
+# either: the chief of staff has it rebased and published again, and that new one merges.
 AUTO_MERGE = {r.strip().lower() for r in os.environ.get("HIVE_AUTO_MERGE_REPOS", "").split(",") if r.strip()}
 AUTO_MERGE_BY = os.environ.get("HIVE_AUTO_MERGE_BY", "the operator")
 AUTO_MERGE_DAYS, AUTO_MERGE_TRIES, AUTO_MERGE_RETRY_S, AUTO_MERGE_PER_STEP = 14, 3, 600, 4
 AUTO_MERGE_FINAL = ("it was already merged", "it was closed", "its head is now", "its head moved", "its branch",
-                    "not a GitHub")   # "GitHub won't merge it" (405) is tried again: it can be main moving meanwhile
+                    "not a GitHub")   # other 405s ("Merge already in progress") are tried again; conflicts: pr_conflict
 PR_HOME = re.compile(r"github\.com/([^/]+/[^/]+)/pull/\d+$", re.I)
 
 
@@ -775,7 +815,12 @@ def auto_merge_prs(st: dict) -> None:
                 or ("*" not in AUTO_MERGE and home.group(1).lower() not in AUTO_MERGE)):
             continue
         t = tried.get(k) if (tried.get(k) or {}).get("sha") == pr["sha"] else {"sha": pr["sha"], "n": 0, "at": 0}
-        if t["n"] >= AUTO_MERGE_TRIES or now - t["at"] < AUTO_MERGE_RETRY_S:
+        if t["n"] >= AUTO_MERGE_TRIES:
+            if merge_conflict(t.get("why")) and not t.get("cleared"):   # given up on before v0.5.52: a tap can't help
+                clear_pr_buttons(pr)
+                t["cleared"] = True
+            continue
+        if now - t["at"] < AUTO_MERGE_RETRY_S:
             continue
         if ran >= AUTO_MERGE_PER_STEP:
             break
@@ -794,13 +839,17 @@ def auto_merge_prs(st: dict) -> None:
                           "new work branches from there. No reply needed.", False, None))
             continue
         why = str(out.get("why") or "no reason given")
+        log(f"auto-merge {pr['url']}: not merged (try {t['n'] + 1}): {why}")
+        if merge_conflict(why):   # it won't go away by itself: redone on top of main at once, not in 20 minutes
+            pr_conflict(st, k, pr, chat, mid, "❌ Not merged automatically")
+            continue
         t.update(n=AUTO_MERGE_TRIES if why.startswith(AUTO_MERGE_FINAL) else t["n"] + 1, at=now, why=why)
         tried[k] = t
-        log(f"auto-merge {pr['url']}: not merged (try {t['n']}): {why}")
         if t["n"] < AUTO_MERGE_TRIES:
             continue
         if why.startswith("it was closed"):   # superseded by a later pull request: nothing to say
             clear_pr_buttons(pr)
+            t["cleared"] = True
             continue
         safe("sendMessage", chat_id=chat, text=f"❌ Not merged automatically: {why}\n{pr['url']}\n"
              "The chief of staff is told; once it's fixed and published again, the new pull request merges by itself.",

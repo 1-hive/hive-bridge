@@ -1174,17 +1174,59 @@ def step(name: str, fn, *args) -> bool:
         return False
 
 
+TG_MAX = 4000   # Telegram's limit is 4096 characters per message (counted after the HTML), with room for a part mark
+HTML_TAG = re.compile(r"</?(?:b|i|u|s|code|pre|a)(?:\s[^>]*)?>")
+
+
+def message_parts(text: str, limit: int = TG_MAX) -> list[str]:
+    """HTML text in messages of at most `limit` characters, split between lines (each line of the digest closes the
+    tags it opens). A longer line loses its tags and is cut, never inside an &entity;."""
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            line = HTML_TAG.sub("", line)
+            cut = limit
+            amp = line.rfind("&", 0, cut)
+            if amp > 0 and ";" not in line[amp:cut]:
+                cut = amp
+            head, line = line[:cut], line[cut:]
+            if cur:
+                parts.append(cur)
+            parts.append(head)
+            cur = ""
+        if cur and len(cur) + 1 + len(line) > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur.strip() or not parts:
+        parts.append(cur)
+    return parts
+
+
 def send_digest(st: dict) -> None:
     d = digest_text(st)
     if d is None:
         log("digest: record unreachable")
         return
     text, head = d
-    tg("sendMessage", chat_id=CARDS, text=text, parse_mode="HTML")
+    # A digest longer than one message goes in parts (from 2026-11-25 08:00 proto-hive's was over 4096 characters
+    # and Telegram refused it every 10 minutes for 31 h). Only the first part's failure means "not sent, try again":
+    # once it is out, the digest counts as sent, so a later part that fails is logged, never sent again with the rest.
+    parts = message_parts(text, TG_MAX - 40)
+    for i, part in enumerate(parts):
+        if i:
+            part = f"<i>({hp.HIVE_ID} digest, part {i + 1} of {len(parts)})</i>\n{part}"
+        try:
+            tg("sendMessage", chat_id=CARDS, text=part, parse_mode="HTML")
+        except Exception as e:
+            if not i:
+                raise
+            log(f"digest part {i + 1} of {len(parts)} not sent: {e}")
     st["digest_pos"], st["digest_at"] = head, time.time()
     st.setdefault("log_shown", {}).update(st.pop("log_next", {}))
     save_state(st)
-    log(f"digest sent (position {head})")
+    log(f"digest sent (position {head}" + (f", {len(parts)} parts" if len(parts) > 1 else "") + ")")
 
 
 def emit(etype: str, gid: str, data: dict | None = None) -> tuple[bool, str]:

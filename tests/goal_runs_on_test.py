@@ -159,6 +159,51 @@ def test_digest(b, tmp: Path, ws: Path) -> None:
     assert st["log_shown"] == {"stage2-learn": 13}, st["log_shown"]
 
 
+def test_long_digest(b) -> None:
+    """Over Telegram's 4096 characters the digest goes in parts, split between lines (proto-hive, 2026-11-25: refused
+    every 10 minutes for 31 h); only a failed first part means "try again"."""
+    clock = [1_794_000_000.0]
+    b.time.time = lambda: clock[0]
+    goals = {f"g{i}": {"id": f"g{i}", "title": f"Goal {i} " + "x" * 80, "status": "active", "escalation": None,
+                       "proposed_at": f"2026-11-{10 + i}T00:00:00Z", "spent": {}} for i in range(12)}
+    tasks = {f"t{i}-{k}": {"id": f"t{i}-{k}-" + "y" * 60, "goal": f"g{i}", "status": "assigned"}
+             for i in range(12) for k in range(6)}
+    state = {"goals": goals, "tasks": tasks}
+    b.hive = lambda *a: (True, json.dumps(state)) if a[0] == "state" else (True, "")
+    b.goal_log = lambda gid: []
+    sent = []
+    b.tg = lambda method, **p: sent.append(p["text"]) or {}
+    st = {"digest_pos": 0, "digest_at": clock[0] - 86400}
+    full, _ = b.digest_text(dict(st))
+    assert len(full) > 4096, len(full)
+    b.send_digest(st)
+    assert len(sent) > 1 and all(len(x) <= 4096 for x in sent), [len(x) for x in sent]
+    assert sent[1].startswith(f"<i>({b.hp.HIVE_ID} digest, part 2 of {len(sent)})</i>"), sent[1][:80]
+    for x in sent:   # every part's tags are closed in it
+        for tag in ("b", "code", "i"):
+            assert x.count(f"<{tag}>") == x.count(f"</{tag}>"), (tag, x)
+    body = "\n".join(x.split("\n", 1)[1] if i else x for i, x in enumerate(sent))
+    assert body == full, "the parts are the digest, in order, nothing lost"
+    assert st["digest_at"] == clock[0]
+    # one line longer than a message: its tags dropped, cut outside an entity
+    parts = b.message_parts("<b>head</b>\n" + "<code>a&amp;b</code> " * 600, 1000)
+    assert all(len(p) <= 1000 for p in parts) and parts[0] == "<b>head</b>", [p[:40] for p in parts]
+    assert all("<code>" not in p and not p.endswith("&am") and not p.endswith("&") for p in parts[1:]), parts[1][-20:]
+    # a later part that fails: logged, the digest still counts as sent (not every part re-sent in 10 minutes)
+    logged, calls = [], []
+
+    def second_fails(method, **p):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("telegram sendMessage: Bad Request")
+        return {}
+    b.tg, b.log = second_fails, logged.append
+    clock[0] += 86400
+    b.send_digest(st)
+    assert st["digest_at"] == clock[0] and any("part 2 of" in m and "not sent" in m for m in logged), logged
+    b.log = lambda m: None
+
+
 CARD_Q = """# question
 Status: The pilot passed its early kill at 43%.
 Before: the self-play run
@@ -253,6 +298,7 @@ def main():
     test_loop_steps(b)
     test_idle_wake(b)
     test_digest(b, tmp, ws)
+    test_long_digest(b)
     test_questions(b)
     test_decided_tap()
     print("ok")
